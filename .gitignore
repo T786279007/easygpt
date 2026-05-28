@@ -1,0 +1,26 @@
+/target/
+/target*/
+
+# Local runtime data. This can include WebView2 cookies, subscriptions,
+# generated mihomo config, logs, and other machine-specific state.
+/data/
+/**/data/WebView2Profile/
+/**/data/clash/
+
+# Downloaded during packaging. Do not store large proxy-core binaries in Git.
+/resources/clash/mihomo.exe
+
+# Temporary local test servers and scratch outputs.
+/tmp_subscription_server/
+/tmp*/
+
+# Windows and editor noise.
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+.idea/
+
+# Local environment files.
+.env
+*.local

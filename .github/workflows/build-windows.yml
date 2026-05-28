@@ -1,0 +1,79 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Windows EXE and installer
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: Verify Rust formatting
+        run: cargo fmt --check
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build installer package
+        shell: pwsh
+        run: .\scripts\package-installer.ps1 -TargetDir target_ci
+
+      - name: Create portable zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path target_ci\artifacts | Out-Null
+          Compress-Archive `
+            -Path target_ci\portable\ChatGPTWebviewClient\* `
+            -DestinationPath target_ci\artifacts\ChatGPTWebviewClient-portable.zip `
+            -Force
+
+      - name: Collect installer
+        shell: pwsh
+        run: |
+          Copy-Item `
+            -Path target_ci\installer\ChatGPTWebviewClient-Setup-*.exe `
+            -Destination target_ci\artifacts `
+            -Force
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChatGPTWebviewClient-windows
+          path: target_ci/artifacts/*
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target_ci/artifacts/*

@@ -1,0 +1,19 @@
+Third-Party Notices
+===================
+
+This package bundles third-party software.
+
+Mihomo
+------
+
+Component: mihomo
+Version: v1.19.25
+Source: https://github.com/MetaCubeX/mihomo
+Bundled file: resources/clash/mihomo.exe
+
+Mihomo is distributed by the MetaCubeX project. Review the upstream
+repository for its current license terms, source code, and notices before
+redistributing this client.
+
+This client launches mihomo as a local sidecar process and uses it only for
+the embedded WebView2 instance. It does not modify the Windows system proxy.
