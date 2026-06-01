@@ -61,6 +61,25 @@ pub struct ProxySubscription {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppSettings {
     pub proxy: ProxyUiSettings,
+    #[serde(default)]
+    pub downloads: DownloadSettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DownloadSettings {
+    pub save_mode: DownloadSaveMode,
+    pub fixed_dir: String,
+    pub last_dir: String,
+    pub ask_each_time: bool,
+    pub max_records: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadSaveMode {
+    Fixed,
+    LastDir,
 }
 
 impl AppSettings {
@@ -139,6 +158,19 @@ impl Default for AppSettings {
                 selected_group: String::new(),
                 selected_proxy: String::new(),
             },
+            downloads: DownloadSettings::default(),
+        }
+    }
+}
+
+impl Default for DownloadSettings {
+    fn default() -> Self {
+        Self {
+            save_mode: DownloadSaveMode::Fixed,
+            fixed_dir: "data/Downloads".to_string(),
+            last_dir: String::new(),
+            ask_each_time: false,
+            max_records: 500,
         }
     }
 }
@@ -518,6 +550,60 @@ mod tests {
     }
 
     #[test]
+    fn default_download_settings_use_portable_downloads_dir() {
+        let settings = DownloadSettings::default();
+
+        assert_eq!(settings.save_mode, DownloadSaveMode::Fixed);
+        assert_eq!(settings.fixed_dir, "data/Downloads");
+        assert!(settings.last_dir.is_empty());
+        assert!(!settings.ask_each_time);
+        assert_eq!(settings.max_records, 500);
+    }
+
+    #[test]
+    fn old_settings_without_downloads_deserialize_with_defaults() {
+        let settings: AppSettings = toml::from_str(
+            r#"
+[proxy]
+mode = "system"
+subscription_url = ""
+mixed_port = 17898
+controller_port = 17899
+"#,
+        )
+        .expect("legacy settings should parse without downloads");
+
+        assert_eq!(settings.downloads, DownloadSettings::default());
+    }
+
+    #[test]
+    fn app_settings_round_trip_includes_downloads() {
+        let settings = AppSettings {
+            downloads: DownloadSettings {
+                save_mode: DownloadSaveMode::LastDir,
+                fixed_dir: "D:/Downloads".to_string(),
+                last_dir: "E:/Recent".to_string(),
+                ask_each_time: true,
+                max_records: 42,
+            },
+            ..Default::default()
+        };
+
+        let rendered = toml::to_string_pretty(&settings).expect("settings should serialize");
+
+        assert!(rendered.contains("[downloads]"));
+        assert!(rendered.contains("save_mode = \"last_dir\""));
+        assert!(rendered.contains("fixed_dir = \"D:/Downloads\""));
+        assert!(rendered.contains("last_dir = \"E:/Recent\""));
+        assert!(rendered.contains("ask_each_time = true"));
+        assert!(rendered.contains("max_records = 42"));
+
+        let parsed: AppSettings = toml::from_str(&rendered).expect("settings should parse");
+
+        assert_eq!(parsed, settings);
+    }
+
+    #[test]
     fn app_settings_round_trip_through_toml() {
         let settings = AppSettings {
             proxy: ProxyUiSettings {
@@ -535,6 +621,7 @@ mod tests {
                 selected_group: "PROXY".to_string(),
                 selected_proxy: "AUTO".to_string(),
             },
+            downloads: DownloadSettings::default(),
         };
 
         let rendered = toml::to_string_pretty(&settings).expect("settings should serialize");

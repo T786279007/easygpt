@@ -198,6 +198,7 @@ name = "chatgpt_webview_client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "directories",
  "reqwest",
  "serde",
@@ -206,6 +207,8 @@ dependencies = [
  "tao",
  "toml 1.1.2+spec-1.1.0",
  "urlencoding",
+ "webview2-com",
+ "windows",
  "windows-sys 0.61.2",
  "winreg",
  "wry",

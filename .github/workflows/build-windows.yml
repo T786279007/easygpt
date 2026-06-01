@@ -53,7 +53,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path target_ci\artifacts | Out-Null
           Compress-Archive `
-            -Path target_ci\portable\ChatGPTWebviewClient\* `
+            -Path target_ci\installer_staging\portable\ChatGPTWebviewClient\* `
             -DestinationPath target_ci\artifacts\ChatGPTWebviewClient-portable.zip `
             -Force
 

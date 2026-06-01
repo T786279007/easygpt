@@ -1,17 +1,38 @@
-# easygpt
+# EasyGPT
 
-A lightweight Windows desktop client for ChatGPT, built with Rust, Wry, and Microsoft Edge WebView2.
+EasyGPT is a lightweight Windows desktop client for ChatGPT and related AI
+sites, built with Rust, Tao, Wry, and Microsoft Edge WebView2.
+
+It opens the AI pages in a native single-window shell, keeps WebView2 login
+state in a portable local `data` directory, and can run an app-local
+Clash/mihomo proxy without changing the system proxy for other applications.
 
 ## Features
 
-- Opens `https://chatgpt.com` directly.
-- Preserves login state between launches.
-- Stores settings, WebView2 profile data, and built-in Clash runtime data in a portable `data` directory next to the EXE.
-- Adds an in-page settings button for proxy configuration.
-- Uses a single native Windows window with no extra frontend bundle.
-- Supports system proxy, direct mode, and an app-local built-in Clash/mihomo proxy.
+- Top toolbar for ChatGPT, Gemini, NotebookLM, and Google AI Studio.
+- Long-lived WebView2 profile under `data/WebView2Profile`.
+- App-local settings under `data/settings.toml`.
+- Built-in mihomo proxy mode with multiple subscription URLs.
+- Node/group selection, node delay tests, and saved proxy selection.
+- Startup progress and proxy failure diagnostics.
+- Browser-like download manager with persistent `data/downloads.json`.
+- Configurable download save path, defaulting to `data/Downloads`.
+- Markdown export and WebView2 native PDF export for the active page.
+- Memory cleanup control and background WebView memory-reduction hooks.
+- Portable package and standard Windows installer scripts.
+- GitHub Actions workflow for Windows build artifacts and tagged releases.
 
-## Run
+## Requirements
+
+- Windows 10/11.
+- Microsoft Edge WebView2 Runtime.
+- Rust stable with the MSVC toolchain.
+- Inno Setup 6 only when building the installer locally.
+
+The packaging scripts download `resources/clash/mihomo.exe` automatically when
+it is missing. The downloaded binary is intentionally ignored by Git.
+
+## Run From Source
 
 ```powershell
 cargo run
@@ -29,44 +50,38 @@ The release executable is created at:
 target\release\chatgpt_webview_client.exe
 ```
 
+For local source-tree runs, the app can find `resources\clash\mihomo.exe` from
+the project root even when the EXE is under `target\debug` or `target\release`.
+
 ## Portable Package
 
 ```powershell
-.\scripts\package-portable.ps1 -TargetDir target_v08_top_multipage
+.\scripts\package-portable.ps1 -TargetDir target_portable
 ```
 
 The portable package is created at:
 
 ```text
-target_v08_top_multipage\portable\ChatGPTWebviewClient
+target_portable\portable\ChatGPTWebviewClient
 ```
 
-Copy this whole folder to another Windows computer to run the app without
-installation.
-
-The packaging script downloads the Windows `mihomo.exe` proxy core from the
-MetaCubeX/mihomo GitHub releases when `resources\clash\mihomo.exe` is missing.
-The downloaded binary is intentionally ignored by Git.
+Copy this whole folder to another Windows computer to run the app without a
+separate installation step.
 
 ## Windows Installer
 
-The installer definition is kept at:
-
-```text
-installer\ChatGPTWebviewClient.iss
-```
-
-Install Inno Setup 6, then run:
-
 ```powershell
-.\scripts\package-installer.ps1 -TargetDir target_v08_top_multipage
+.\scripts\package-installer.ps1 -TargetDir target_installer
 ```
 
-The standard installer is created at:
+The installer is created at:
 
 ```text
-target_v08_top_multipage\installer\ChatGPTWebviewClient-Setup-0.1.0.exe
+target_installer\installer\ChatGPTWebviewClient-Setup-0.1.0.exe
 ```
+
+If Inno Setup 6 is not installed, the script still prepares the portable source
+folder and prints the installer script path.
 
 The installer uses a per-user directory:
 
@@ -74,118 +89,108 @@ The installer uses a per-user directory:
 %LOCALAPPDATA%\Programs\ChatGPTWebviewClient
 ```
 
-This keeps the app's portable `data` directory writable without requiring
-administrator permissions. Add `-IncludeCurrentData` when you intentionally want
-to include the current local `data` folder in the installer source.
+Use `-IncludeCurrentData` only when you intentionally want to package the
+current local `data` directory into the installer source.
 
-## Login State
+## Data And Login State
 
-Cookies, local storage, cache, and session data are saved in:
-
-```text
-.\data\WebView2Profile
-```
-
-After you log in once, reopening the EXE should keep the session unless the site
-invalidates it. Copying the whole portable folder to another device also copies
-the WebView2 profile, but ChatGPT, Google AI Studio, and NotebookLM may still ask
-you to verify or sign in again because their cookies can be tied to device,
-browser, IP, or OS-level encryption state.
-
-## Proxy and Built-in Clash Support
-
-The settings button in the ChatGPT window saves app settings to:
+Runtime data is stored next to the EXE:
 
 ```text
-.\data\settings.toml
+data\
+  WebView2Profile\
+  settings.toml
+  downloads.json
+  Downloads\
+  clash\
 ```
 
-On first launch after upgrading from an older build, the app copies existing
-settings and `WebView2Profile` data from `%LOCALAPPDATA%\ChatGPTWebviewClient`
-into `.\data` if the portable files do not already exist.
+After signing in once, reopening the same portable folder should keep the
+session unless the site invalidates it. Copying the portable folder copies the
+profile too, but ChatGPT and Google services can still request verification
+because their cookies may depend on device, browser, IP, or OS state.
 
-When proxy mode is `internal_clash`, the app starts the bundled mihomo core from:
+Do not commit or publish the `data` directory. It may contain login state,
+subscription URLs, proxy config, logs, downloads, and other machine-specific
+files.
+
+## Proxy
+
+Proxy modes:
+
+- `direct`: no proxy.
+- `system`: use the Windows user proxy setting for this WebView2 instance.
+- `manual`: use the proxy configured by environment/settings.
+- `internal_clash`: start bundled mihomo and point only this app at it.
+
+When `internal_clash` is enabled, EasyGPT writes sanitized mihomo runtime files
+under:
 
 ```text
-resources\clash\mihomo.exe
+data\clash\
 ```
 
-It downloads the configured subscription, writes a sanitized app-local config under:
+The built-in proxy is app-local. It does not enable the Windows global proxy and
+should not affect other applications.
+
+The settings UI supports:
+
+- multiple subscription links;
+- selecting the active subscription;
+- refreshing subscription/config;
+- listing proxy groups and nodes;
+- switching nodes;
+- testing node latency;
+- saving the selected group and node for the next launch;
+- viewing recent mihomo log lines.
+
+## Downloads
+
+The top toolbar download button opens the download manager. The manager shows
+recent downloads, supports search, opens files/folders, deletes records, clears
+completed records, and links to download save-path settings.
+
+Download history is stored at:
 
 ```text
-.\data\clash\config.yaml
+data\downloads.json
 ```
 
-and points only this WebView2 instance at the generated local proxy port.
-
-Settings include proxy mode, multiple subscription URLs, active subscription
-selection, subscription refresh behavior, node-selection fields, and the
-preferred local ports.
-
-If subscription update fails but a cached subscription already exists, the app
-falls back to the cached file so temporary subscription outages do not block
-startup.
-
-For faster startup, the app uses the cached subscription first when one is
-available. Use the proxy console's refresh button when you want to update the
-subscription immediately.
-
-The in-page proxy console can:
-
-- show whether the built-in mihomo runtime is running;
-- keep multiple subscription links, add/update/delete them, and choose the active one;
-- list strategy groups and nodes from the local mihomo Controller API;
-- switch the active node and save the selected group/node;
-- restore the saved group/node on the next launch;
-- test latency for one node or every node in the selected group;
-- refresh the subscription/config when live reload is supported by mihomo;
-- show the latest mihomo log lines.
-
-To switch subscription providers, open the settings button in the lower-right
-corner, choose an active subscription from the dropdown, or add a new name and
-URL, then save. The selected subscription is stored in:
+The default save location is:
 
 ```text
-.\data\settings.toml
+data\Downloads
 ```
 
-Node delay tests run outside the WebView2 UI thread, and "test all" is limited
-to small batches so a slow node does not freeze the ChatGPT page.
+## Export
 
-The current version reads the Windows user proxy setting from:
+The toolbar export menu supports:
+
+- Markdown export through visible conversation extraction.
+- PDF export through WebView2 native `PrintToPdf` on Windows, with a fallback
+  record if the native path fails.
+
+Exported files are written through the same download destination resolver used
+by normal downloads.
+
+## GitHub Actions
+
+The workflow at `.github/workflows/build-windows.yml` runs on pushes, pull
+requests, manual dispatch, and `v*` tags. It performs:
 
 ```text
-HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings
+cargo fmt --check
+cargo test
+cargo clippy --all-targets -- -D warnings
+.\scripts\package-installer.ps1 -TargetDir target_ci
 ```
 
-When `ProxyEnable` is `1`, it parses `ProxyServer` and passes it to WebView2 explicitly. For example, Clash Verge's system proxy:
-
-```text
-http=127.0.0.1:7898;https=127.0.0.1:7898
-```
-
-becomes:
-
-```text
---proxy-server=http://127.0.0.1:7898
-```
-
-You can override this by setting:
-
-```powershell
-$env:CHATGPT_CLIENT_PROXY = "http://127.0.0.1:7898"
-```
-
-A later version can add:
-
-- node selection;
-- subscription auto-refresh;
-- in-app mihomo logs;
-- a packaged installer.
+Artifacts include a portable zip and installer. Tagged builds also publish a
+GitHub Release.
 
 ## Diagnostics
 
-For debugging WebView2 with Chrome DevTools Protocol:
+For WebView2 Chrome DevTools Protocol debugging:
 
 ```powershell
 $env:CHATGPT_CLIENT_REMOTE_DEBUG_PORT = "9223"
@@ -196,4 +201,17 @@ Then open:
 
 ```text
 http://127.0.0.1:9223/json/list
-````r`n
+```
+
+Local CDP lists and debug logs such as `cdp-list.json` and `debug-*.log` are
+ignored by Git.
+
+## Repository Hygiene
+
+Tracked source files are enough to build and package the app. These files are
+intentionally not tracked:
+
+- `target*` build outputs.
+- `data` runtime state.
+- `resources/clash/mihomo.exe`.
+- temporary subscription servers and local debug logs.

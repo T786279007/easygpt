@@ -386,27 +386,54 @@ fn bundled_mihomo_path() -> Result<PathBuf> {
         .parent()
         .context("could not locate current executable directory")?;
 
-    let release_sidecar = exe_dir
-        .join("resources")
-        .join(CLASH_DIR_NAME)
-        .join(MIHOMO_EXE_NAME);
-    if release_sidecar.exists() {
-        return Ok(release_sidecar);
+    let mut candidates = bundled_mihomo_path_candidates_from_exe_dir(exe_dir);
+    if let Ok(current_dir) = std::env::current_dir() {
+        candidates.push(
+            current_dir
+                .join("resources")
+                .join(CLASH_DIR_NAME)
+                .join(MIHOMO_EXE_NAME),
+        );
     }
 
-    let dev_sidecar = std::env::current_dir()
-        .context("could not locate current working directory")?
-        .join("resources")
-        .join(CLASH_DIR_NAME)
-        .join(MIHOMO_EXE_NAME);
-    if dev_sidecar.exists() {
-        return Ok(dev_sidecar);
+    for candidate in &candidates {
+        if candidate.exists() {
+            return Ok(candidate.clone());
+        }
     }
 
     bail!(
-        "could not find bundled mihomo.exe. Expected {} or {}",
-        release_sidecar.display(),
-        dev_sidecar.display()
+        "could not find bundled mihomo.exe. Checked: {}",
+        candidates
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn bundled_mihomo_path_candidates_from_exe_dir(exe_dir: &Path) -> Vec<PathBuf> {
+    let sidecar = |base: &Path| {
+        base.join("resources")
+            .join(CLASH_DIR_NAME)
+            .join(MIHOMO_EXE_NAME)
+    };
+
+    let mut candidates = vec![sidecar(exe_dir)];
+
+    if is_cargo_profile_dir(exe_dir)
+        && let Some(project_dir) = exe_dir.parent().and_then(|target_dir| target_dir.parent())
+    {
+        candidates.push(sidecar(project_dir));
+    }
+
+    candidates
+}
+
+fn is_cargo_profile_dir(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("release" | "debug")
     )
 }
 
@@ -1189,6 +1216,7 @@ rules:
                 selected_group: "PROXY".to_string(),
                 selected_proxy: String::new(),
             },
+            downloads: Default::default(),
         };
 
         assert!(saved_proxy_selection(&settings).is_none());
@@ -1208,6 +1236,7 @@ rules:
                 selected_group: "PROXY".to_string(),
                 selected_proxy: "香港 01".to_string(),
             },
+            downloads: Default::default(),
         };
 
         assert_eq!(saved_proxy_selection(&settings), Some(("PROXY", "香港 01")));
@@ -1227,6 +1256,7 @@ rules:
                 selected_group: String::new(),
                 selected_proxy: String::new(),
             },
+            downloads: Default::default(),
         };
 
         let (mixed_port, controller_port) =
@@ -1250,6 +1280,7 @@ rules:
                 selected_group: String::new(),
                 selected_proxy: String::new(),
             },
+            downloads: Default::default(),
         };
 
         let error = configured_runtime_ports(&settings).expect_err("same port should be rejected");
@@ -1282,6 +1313,7 @@ rules:
                 selected_group: String::new(),
                 selected_proxy: String::new(),
             },
+            downloads: Default::default(),
         };
 
         let ports = resolved_runtime_ports(&settings).expect("ports should resolve");
@@ -1313,6 +1345,7 @@ rules:
                 selected_group: String::new(),
                 selected_proxy: String::new(),
             },
+            downloads: Default::default(),
         };
 
         let ports = resolved_runtime_ports(&settings).expect("ports should resolve");
@@ -1365,6 +1398,25 @@ rules:
         assert_eq!(
             subscription_cache_file_name("sub/../bad"),
             "sub____bad.yaml"
+        );
+    }
+
+    #[test]
+    fn mihomo_path_candidates_include_project_root_when_running_from_target_release() {
+        let exe_dir = PathBuf::from(r"C:\repo\chatgpt_webview_client\target\release");
+        let candidates = bundled_mihomo_path_candidates_from_exe_dir(&exe_dir);
+        let rendered = candidates
+            .iter()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect::<Vec<_>>();
+
+        assert!(rendered.iter().any(|path| {
+            path.ends_with("chatgpt_webview_client/target/release/resources/clash/mihomo.exe")
+        }));
+        assert!(
+            rendered
+                .iter()
+                .any(|path| path.ends_with("chatgpt_webview_client/resources/clash/mihomo.exe"))
         );
     }
 }

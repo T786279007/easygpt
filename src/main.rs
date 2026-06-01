@@ -3,33 +3,54 @@
 use std::{
     borrow::Cow,
     collections::HashMap,
+    fmt::Write as _,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chatgpt_webview_client::{
-    AppSettings, CHATGPT_URL, ProxyMode, ProxyScheme, ProxySettings,
+    AppSettings, CHATGPT_URL, DownloadSaveMode, DownloadSettings, ProxyMode, ProxyScheme,
+    ProxySettings,
     clash::{ClashRuntime, read_mihomo_log_tail, resolved_runtime_ports, start_internal_clash},
     controller::{ProxyGroup, ProxyState, preferred_proxy_group, preferred_proxy_node},
     ensure_webview_profile_dir, load_settings, save_settings, startup_proxy,
 };
+use reqwest::blocking::Client;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tao::{
     dpi::LogicalSize,
-    event::{Event, WindowEvent},
-    event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
+    event::{Event, StartCause, WindowEvent},
+    event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget},
     window::{Window, WindowBuilder},
 };
 use urlencoding::encode;
 use wry::{
     NewWindowResponse, ProxyConfig, ProxyEndpoint, WebContext, WebView, WebViewBuilder,
-    http::{Response, header::CONTENT_TYPE},
+    http::{
+        Response,
+        header::{CACHE_CONTROL, CONTENT_TYPE, EXPIRES, PRAGMA},
+    },
 };
 
 #[cfg(windows)]
 use wry::{MemoryUsageLevel, WebViewBuilderExtWindows, WebViewExtWindows};
+
+#[cfg(windows)]
+use webview2_com::{
+    CoTaskMemPWSTR,
+    Microsoft::Web::WebView2::Win32::{
+        COREWEBVIEW2_PRINT_ORIENTATION_PORTRAIT, ICoreWebView2_7, ICoreWebView2Environment6,
+    },
+    PrintToPdfCompletedHandler,
+};
+
+#[cfg(windows)]
+use windows::core::Interface as _;
 
 #[cfg(windows)]
 const APP_MUTEX_NAME: &str = "Local\\ChatGPTWebviewClientSingleInstance";
@@ -37,7 +58,9 @@ const DELAY_TEST_URL: &str = "https://chatgpt.com/cdn-cgi/trace";
 const DELAY_TIMEOUT_MS: u64 = 5000;
 const TOP_BAR_HEIGHT: f64 = 52.0;
 const SHELL_PROTOCOL: &str = "aiclient";
-const SHELL_URL: &str = "aiclient://shell/index.html";
+const SHELL_URL: &str = "aiclient://shell/index.html?v=download-manager-native-v2";
+const DOWNLOAD_HISTORY_FILE_NAME: &str = "downloads.json";
+const DEFAULT_MAX_DOWNLOAD_RECORDS: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum AiSite {
@@ -91,19 +114,386 @@ impl AiSite {
     }
 }
 
+impl ExportFormat {
+    fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "markdown" | "md" => Some(Self::Markdown),
+            "pdf" => Some(Self::Pdf),
+            _ => None,
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Markdown => "markdown",
+            Self::Pdf => "pdf",
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Markdown => "md",
+            Self::Pdf => "pdf",
+        }
+    }
+}
+
 enum UserEvent {
     Ipc { target: IpcTarget, body: String },
     IpcResponse { target: IpcTarget, response: String },
+    DownloadIpcResponse { target: IpcTarget, response: String },
+    DownloadEvent(DownloadEvent),
+    LatencyEvent(LatencyEvent),
+    StartupProgress(StartupProgress),
     RuntimeReady,
+    RuntimeFailed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartupStage {
+    LoadSettings,
+    ResolvePorts,
+    LoadSubscription,
+    BuildMihomoConfig,
+    StartMihomo,
+    WaitController,
+    RestoreNode,
+    CheckConnectivity,
+    Ready,
+    Failed,
+}
+
+impl StartupStage {
+    const ALL: [StartupStage; 10] = [
+        StartupStage::LoadSettings,
+        StartupStage::ResolvePorts,
+        StartupStage::LoadSubscription,
+        StartupStage::BuildMihomoConfig,
+        StartupStage::StartMihomo,
+        StartupStage::WaitController,
+        StartupStage::RestoreNode,
+        StartupStage::CheckConnectivity,
+        StartupStage::Ready,
+        StartupStage::Failed,
+    ];
+
+    fn all() -> &'static [StartupStage] {
+        &Self::ALL
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::LoadSettings => "load_settings",
+            Self::ResolvePorts => "resolve_ports",
+            Self::LoadSubscription => "load_subscription",
+            Self::BuildMihomoConfig => "build_mihomo_config",
+            Self::StartMihomo => "start_mihomo",
+            Self::WaitController => "wait_controller",
+            Self::RestoreNode => "restore_node",
+            Self::CheckConnectivity => "check_connectivity",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::LoadSettings => "读取配置",
+            Self::ResolvePorts => "检查本地端口",
+            Self::LoadSubscription => "读取或更新订阅",
+            Self::BuildMihomoConfig => "生成代理配置",
+            Self::StartMihomo => "启动 mihomo",
+            Self::WaitController => "等待控制器就绪",
+            Self::RestoreNode => "恢复上次节点",
+            Self::CheckConnectivity => "检测 ChatGPT 连通性",
+            Self::Ready => "代理已就绪",
+            Self::Failed => "代理启动失败",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StartupProgress {
+    stage: StartupStage,
+    elapsed_secs: u64,
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadEventKind {
+    Started,
+    Completed,
+    Failed,
+    Diagnostic,
+}
+
+#[derive(Debug, Clone)]
+struct DownloadEvent {
+    kind: DownloadEventKind,
+    status: String,
+    path: Option<PathBuf>,
+    url: Option<String>,
+    bytes: Option<u64>,
+    success: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DownloadRecord {
+    id: u64,
+    filename: String,
+    status: DownloadRecordStatus,
+    path: Option<PathBuf>,
+    url: Option<String>,
+    bytes: Option<u64>,
+    message: String,
+    timestamp_ms: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum DownloadRecordStatus {
+    Started,
+    Completed,
+    Failed,
+    Diagnostic,
+    Cancelled,
+    Missing,
+}
+
+impl DownloadRecordStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Diagnostic => "diagnostic",
+            Self::Cancelled => "cancelled",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DownloadHistory {
+    next_id: u64,
+    max_records: usize,
+    records: Vec<DownloadRecord>,
+}
+
+impl Default for DownloadHistory {
+    fn default() -> Self {
+        Self::new(DEFAULT_MAX_DOWNLOAD_RECORDS)
+    }
+}
+
+impl DownloadHistory {
+    fn new(max_records: usize) -> Self {
+        Self {
+            next_id: 0,
+            max_records: max_records.max(1),
+            records: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, event: DownloadEvent) {
+        let status = match event.kind {
+            DownloadEventKind::Started => DownloadRecordStatus::Started,
+            DownloadEventKind::Completed if event.success => DownloadRecordStatus::Completed,
+            DownloadEventKind::Completed | DownloadEventKind::Failed => {
+                DownloadRecordStatus::Failed
+            }
+            DownloadEventKind::Diagnostic => DownloadRecordStatus::Diagnostic,
+        };
+        let filename = event
+            .path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                event
+                    .url
+                    .as_deref()
+                    .and_then(|url| url.rsplit('/').next())
+                    .filter(|name| !name.trim().is_empty())
+            })
+            .unwrap_or("download")
+            .to_string();
+
+        if matches!(
+            event.kind,
+            DownloadEventKind::Completed | DownloadEventKind::Failed
+        ) && let Some(existing) = self.matching_active_record_mut(&event)
+        {
+            existing.status = status;
+            existing.path = event.path;
+            existing.url = event.url;
+            existing.bytes = event.bytes;
+            existing.message = event.status;
+            existing.timestamp_ms = now_millis();
+            return;
+        }
+
+        self.next_id += 1;
+        self.records.insert(
+            0,
+            DownloadRecord {
+                id: self.next_id,
+                filename,
+                status,
+                path: event.path,
+                url: event.url,
+                bytes: event.bytes,
+                message: event.status,
+                timestamp_ms: now_millis(),
+            },
+        );
+        self.records.truncate(self.max_records);
+    }
+
+    fn matching_active_record_mut(&mut self, event: &DownloadEvent) -> Option<&mut DownloadRecord> {
+        self.records.iter_mut().find(|record| {
+            record.status == DownloadRecordStatus::Started
+                && ((event.path.is_some() && record.path == event.path)
+                    || (event.url.is_some() && record.url == event.url))
+        })
+    }
+
+    fn clear_completed(&mut self) {
+        self.records
+            .retain(|record| !matches!(record.status, DownloadRecordStatus::Completed));
+    }
+
+    fn delete_record(&mut self, id: u64) -> bool {
+        let before = self.records.len();
+        self.records.retain(|record| record.id != id);
+        before != self.records.len()
+    }
+
+    fn payload(&self) -> Value {
+        json!({
+            "downloads": self.records.iter().map(download_record_payload).collect::<Vec<_>>(),
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DownloadHistoryStore {
+    version: u32,
+    next_id: u64,
+    records: Vec<DownloadRecord>,
+}
+
+fn download_record_payload(record: &DownloadRecord) -> Value {
+    json!({
+        "id": record.id,
+        "filename": record.filename,
+        "status": record.status.as_str(),
+        "path": record.path.as_ref().map(|path| path.display().to_string()),
+        "url": record.url,
+        "bytes": record.bytes,
+        "message": record.message,
+        "timestamp_ms": record.timestamp_ms,
+    })
+}
+
+fn download_history_path() -> Result<PathBuf> {
+    Ok(chatgpt_webview_client::app_data_dir()?.join(DOWNLOAD_HISTORY_FILE_NAME))
+}
+
+fn load_download_history(max_records: usize) -> DownloadHistory {
+    let Ok(path) = download_history_path() else {
+        return DownloadHistory::new(max_records);
+    };
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return DownloadHistory::new(max_records);
+    };
+    let Ok(store) = serde_json::from_str::<DownloadHistoryStore>(&contents) else {
+        eprintln!("could not parse download history at {}", path.display());
+        return DownloadHistory::new(max_records);
+    };
+
+    download_history_from_store(store, max_records)
+}
+
+fn download_history_from_store(store: DownloadHistoryStore, max_records: usize) -> DownloadHistory {
+    let mut records = store.records;
+    for record in &mut records {
+        if record.status == DownloadRecordStatus::Started {
+            record.status = DownloadRecordStatus::Failed;
+            record.message = "上次退出时下载未完成".to_string();
+        }
+    }
+    records.truncate(max_records.max(1));
+
+    DownloadHistory {
+        next_id: store.next_id,
+        max_records: max_records.max(1),
+        records,
+    }
+}
+
+fn save_download_history(history: &DownloadHistory) -> Result<()> {
+    let path = download_history_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "could not create download history directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let store = download_history_store(history);
+    let contents =
+        serde_json::to_vec_pretty(&store).context("could not serialize download history")?;
+    std::fs::write(&path, contents)
+        .with_context(|| format!("could not write download history to {}", path.display()))
+}
+
+fn download_history_store(history: &DownloadHistory) -> DownloadHistoryStore {
+    DownloadHistoryStore {
+        version: 1,
+        next_id: history.next_id,
+        records: history.records.clone(),
+    }
+}
+
+fn persist_download_history(history: &DownloadHistory) {
+    if let Err(error) = save_download_history(history) {
+        eprintln!("could not save download history: {error:#}");
+    }
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+#[derive(Debug, Clone)]
+struct LatencyEvent {
+    site: AiSite,
+    delay_ms: Option<u64>,
+    success: bool,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum IpcTarget {
     Shell,
+    DownloadManager,
     Site(AiSite),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportFormat {
+    Markdown,
+    Pdf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ShellCommand {
     SwitchSite(AiSite),
     CloseSite(AiSite),
@@ -111,6 +501,20 @@ enum ShellCommand {
     NavBack,
     NavForward,
     ReloadActive,
+    OpenDownloadPath(PathBuf),
+    OpenDownloadFolder(PathBuf),
+    OpenDownloadManager,
+    CloseDownloadManager,
+    ClearCompletedDownloads,
+    DeleteDownloadRecord(u64),
+    OpenDownloadSettings,
+    MeasureLatency(AiSite),
+    ExportConversation(ExportFormat),
+}
+
+struct DownloadManagerWindow {
+    window: Window,
+    webview: WebView,
 }
 
 struct AppRuntimeState {
@@ -307,9 +711,6 @@ fn run_app() -> Result<()> {
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     let event_proxy = event_loop.create_proxy();
     spawn_runtime_watchdog(Arc::clone(&app_state));
-    if matches!(settings.proxy.mode, ProxyMode::InternalClash) {
-        spawn_initial_runtime_start(Arc::clone(&app_state), event_proxy.clone());
-    }
     let window = WindowBuilder::new()
         .with_title("AI Web Client")
         .with_inner_size(LogicalSize::new(1280.0, 900.0))
@@ -322,6 +723,9 @@ fn run_app() -> Result<()> {
     let initial_site = AiSite::ChatGpt;
     let mut active_site = initial_site;
     let mut runtime_ready = !matches!(settings.proxy.mode, ProxyMode::InternalClash);
+    let mut download_history = load_download_history(settings.downloads.max_records);
+    let mut download_manager_window: Option<DownloadManagerWindow> = None;
+    let main_window_id = window.id();
     let (window_width, window_height) = logical_window_size(&window);
     let shell_webview = build_shell_webview(
         &window,
@@ -348,13 +752,25 @@ fn run_app() -> Result<()> {
     .context("could not create the initial content WebView2 instance")?;
     content_webviews.insert(initial_site, initial_content);
     apply_content_memory_policy(&content_webviews, active_site);
+    sync_downloads(&shell_webview, &download_history);
+    let mut initial_runtime_start_spawned =
+        !matches!(settings.proxy.mode, ProxyMode::InternalClash);
 
-    event_loop.run(move |event, _, control_flow| {
+    event_loop.run(move |event, event_loop, control_flow| {
         *control_flow = ControlFlow::Wait;
 
         match event {
+            Event::NewEvents(StartCause::Init)
+                if should_spawn_initial_runtime_start(
+                    settings.proxy.mode.clone(),
+                    initial_runtime_start_spawned,
+                ) =>
+            {
+                initial_runtime_start_spawned = true;
+                spawn_initial_runtime_start(Arc::clone(&app_state), event_proxy.clone());
+            }
             Event::UserEvent(UserEvent::Ipc { target, body }) => {
-                if target == IpcTarget::Shell {
+                if matches!(target, IpcTarget::Shell | IpcTarget::DownloadManager) {
                     match parse_shell_command(&body) {
                         Some(Ok(ShellCommand::SwitchSite(site))) => {
                             let result = switch_active_site(
@@ -412,6 +828,141 @@ fn run_app() -> Result<()> {
                                 eprintln!("could not reload active page: {error:#}");
                             }
                         }
+                        Some(Ok(ShellCommand::OpenDownloadPath(path))) => {
+                            if let Err(error) = reveal_download_path(&path) {
+                                let event = DownloadEvent {
+                                    kind: DownloadEventKind::Failed,
+                                    status: format!("打开文件位置失败：{error:#}"),
+                                    path: Some(path),
+                                    url: None,
+                                    bytes: None,
+                                    success: false,
+                                };
+                                let script = download_notification_script(
+                                    &event.status,
+                                    event.path.as_deref(),
+                                    event.success,
+                                );
+                                let _ = shell_webview.evaluate_script(&script);
+                            }
+                        }
+                        Some(Ok(ShellCommand::OpenDownloadFolder(path))) => {
+                            if let Err(error) = reveal_download_folder(&path) {
+                                let event = DownloadEvent {
+                                    kind: DownloadEventKind::Failed,
+                                    status: format!("打开下载目录失败：{error:#}"),
+                                    path: Some(path),
+                                    url: None,
+                                    bytes: None,
+                                    success: false,
+                                };
+                                let script = download_notification_script(
+                                    &event.status,
+                                    event.path.as_deref(),
+                                    event.success,
+                                );
+                                let _ = shell_webview.evaluate_script(&script);
+                            }
+                        }
+                        Some(Ok(ShellCommand::OpenDownloadManager)) => {
+                            if let Err(error) = open_download_manager_window(
+                                &mut download_manager_window,
+                                event_loop,
+                                event_proxy.clone(),
+                                &download_history,
+                            ) {
+                                eprintln!("could not open download manager: {error:#}");
+                                let event = DownloadEvent {
+                                    kind: DownloadEventKind::Failed,
+                                    status: format!("打开下载管理失败：{error:#}"),
+                                    path: None,
+                                    url: None,
+                                    bytes: None,
+                                    success: false,
+                                };
+                                let script = download_notification_script(
+                                    &event.status,
+                                    event.path.as_deref(),
+                                    event.success,
+                                );
+                                let _ = shell_webview.evaluate_script(&script);
+                            }
+                        }
+                        Some(Ok(ShellCommand::CloseDownloadManager)) => {
+                            download_manager_window = None;
+                        }
+                        Some(Ok(ShellCommand::ClearCompletedDownloads)) => {
+                            download_history.clear_completed();
+                            persist_download_history(&download_history);
+                            sync_downloads(&shell_webview, &download_history);
+                            sync_download_manager_window(&download_manager_window, &download_history);
+                        }
+                        Some(Ok(ShellCommand::DeleteDownloadRecord(id))) => {
+                            if download_history.delete_record(id) {
+                                persist_download_history(&download_history);
+                                sync_downloads(&shell_webview, &download_history);
+                                sync_download_manager_window(
+                                    &download_manager_window,
+                                    &download_history,
+                                );
+                            }
+                        }
+                        Some(Ok(ShellCommand::OpenDownloadSettings)) => {
+                            download_manager_window = None;
+                            if let Some(webview) = content_webviews.get(&active_site)
+                                && let Err(error) = webview.evaluate_script(
+                                    "window.__chatgptClientOpenSettings ? window.__chatgptClientOpenSettings('downloads') : document.getElementById('chatgpt-client-settings-button')?.click();",
+                                )
+                            {
+                                eprintln!("could not open download settings: {error:#}");
+                            }
+                        }
+                        Some(Ok(ShellCommand::MeasureLatency(site))) => {
+                            let app_state = Arc::clone(&app_state);
+                            let event_proxy = event_proxy.clone();
+                            thread::spawn(move || {
+                                let event = measure_site_latency(site, &app_state);
+                                let _ = event_proxy.send_event(UserEvent::LatencyEvent(event));
+                            });
+                        }
+                        Some(Ok(ShellCommand::ExportConversation(format))) => {
+                            if let Some(webview) = content_webviews.get(&active_site) {
+                                let result = match format {
+                                    ExportFormat::Markdown => webview
+                                        .evaluate_script(&export_conversation_script(
+                                            active_site,
+                                            format,
+                                        ))
+                                        .map_err(anyhow::Error::from),
+                                    ExportFormat::Pdf => {
+                                        export_current_page_pdf(webview, active_site).map(|event| {
+                                            let _ = event_proxy
+                                                .send_event(UserEvent::DownloadEvent(event));
+                                        })
+                                    }
+                                };
+
+                                if let Err(error) = result {
+                                    let event = DownloadEvent {
+                                        kind: DownloadEventKind::Failed,
+                                        status: format!("导出失败：{error:#}"),
+                                        path: None,
+                                        url: None,
+                                        bytes: None,
+                                        success: false,
+                                    };
+                                    let script = download_notification_script(
+                                        &event.status,
+                                        event.path.as_deref(),
+                                        event.success,
+                                    );
+                                    let _ = shell_webview.evaluate_script(&script);
+                                    download_history.record(event);
+                                    persist_download_history(&download_history);
+                                    sync_downloads(&shell_webview, &download_history);
+                                }
+                            }
+                        }
                         Some(Err(error)) => eprintln!("invalid shell IPC command: {error:#}"),
                         None => eprintln!("ignored unknown shell IPC command: {body}"),
                     }
@@ -435,6 +986,10 @@ fn run_app() -> Result<()> {
                     );
                     let result = match target {
                         IpcTarget::Shell => shell_webview.evaluate_script(&script),
+                        IpcTarget::DownloadManager => download_manager_window
+                            .as_ref()
+                            .map(|manager| manager.webview.evaluate_script(&script))
+                            .unwrap_or(Ok(())),
                         IpcTarget::Site(site) => content_webviews
                             .get(&site)
                             .map(|webview| webview.evaluate_script(&script))
@@ -443,6 +998,39 @@ fn run_app() -> Result<()> {
                     if let Err(error) = result {
                         eprintln!("could not send memory optimization response: {error:#}");
                     }
+                    return;
+                }
+
+                if let Some(event) = parse_latency_event(&body) {
+                    let _ = event_proxy.send_event(UserEvent::LatencyEvent(event));
+                    return;
+                }
+
+                if is_save_download_request(&body) {
+                    let event_proxy = event_proxy.clone();
+                    thread::spawn(move || {
+                        let (response, event) = handle_save_download_message_with_event(&body);
+                        let _ = event_proxy
+                            .send_event(UserEvent::DownloadIpcResponse { target, response });
+                        let _ = event_proxy.send_event(UserEvent::DownloadEvent(event));
+                    });
+                    return;
+                }
+
+                if let Some(event) = parse_download_diagnostic_event(&body) {
+                    let _ = event_proxy.send_event(UserEvent::DownloadEvent(event));
+                    return;
+                }
+
+                if is_export_conversation_request(&body) {
+                    let event_proxy = event_proxy.clone();
+                    thread::spawn(move || {
+                        let (response, event) =
+                            handle_export_conversation_message_with_event(&body);
+                        let _ = event_proxy
+                            .send_event(UserEvent::DownloadIpcResponse { target, response });
+                        let _ = event_proxy.send_event(UserEvent::DownloadEvent(event));
+                    });
                     return;
                 }
 
@@ -460,6 +1048,10 @@ fn run_app() -> Result<()> {
                 );
                 let result = match target {
                     IpcTarget::Shell => shell_webview.evaluate_script(&script),
+                    IpcTarget::DownloadManager => download_manager_window
+                        .as_ref()
+                        .map(|manager| manager.webview.evaluate_script(&script))
+                        .unwrap_or(Ok(())),
                     IpcTarget::Site(site) => content_webviews
                         .get(&site)
                         .map(|webview| webview.evaluate_script(&script))
@@ -467,6 +1059,74 @@ fn run_app() -> Result<()> {
                 };
                 if let Err(error) = result {
                     eprintln!("could not send IPC response to target webview: {error:#}");
+                }
+            }
+            Event::UserEvent(UserEvent::DownloadIpcResponse { target, response }) => {
+                let script = format!(
+                    "window.__chatgptClientReceive && window.__chatgptClientReceive({});",
+                    response
+                );
+                let result = match target {
+                    IpcTarget::Shell => shell_webview.evaluate_script(&script),
+                    IpcTarget::DownloadManager => download_manager_window
+                        .as_ref()
+                        .map(|manager| manager.webview.evaluate_script(&script))
+                        .unwrap_or(Ok(())),
+                    IpcTarget::Site(site) => content_webviews
+                        .get(&site)
+                        .map(|webview| webview.evaluate_script(&script))
+                        .unwrap_or(Ok(())),
+                };
+                if let Err(error) = result {
+                    eprintln!("could not send download IPC response: {error:#}");
+                }
+            }
+            Event::UserEvent(UserEvent::DownloadEvent(event)) => {
+                let last_download_dir = event
+                    .path
+                    .as_ref()
+                    .and_then(|path| path.parent())
+                    .map(|path| path.display().to_string());
+                let script = download_notification_script(
+                    &event.status,
+                    event.path.as_deref(),
+                    event.success,
+                );
+                if let Err(error) = shell_webview.evaluate_script(&script) {
+                    eprintln!("could not show download notification: {error:#}");
+                }
+                download_history.record(event);
+                persist_download_history(&download_history);
+                sync_downloads(&shell_webview, &download_history);
+                sync_download_manager_window(&download_manager_window, &download_history);
+                if let Some(last_dir) = last_download_dir {
+                    let mut should_save_settings = false;
+                    if let Ok(mut state) = app_state.lock()
+                        && state.settings.downloads.last_dir != last_dir
+                    {
+                        state.settings.downloads.last_dir = last_dir.clone();
+                        should_save_settings = true;
+                        if let Err(error) = save_settings(&state.settings) {
+                            eprintln!("could not save download last directory: {error:#}");
+                        }
+                    }
+                    if should_save_settings {
+                        sync_download_settings_last_dir(&content_webviews, &last_dir);
+                    }
+                }
+            }
+            Event::UserEvent(UserEvent::LatencyEvent(event)) => {
+                let script = latency_notification_script(&event);
+                if let Err(error) = shell_webview.evaluate_script(&script) {
+                    eprintln!("could not show latency notification: {error:#}");
+                }
+            }
+            Event::UserEvent(UserEvent::StartupProgress(progress)) => {
+                let script = startup_progress_script(&progress);
+                for webview in content_webviews.values() {
+                    if let Err(error) = webview.evaluate_script(&script) {
+                        eprintln!("could not update startup progress: {error:#}");
+                    }
                 }
             }
             Event::UserEvent(UserEvent::RuntimeReady) => {
@@ -479,13 +1139,25 @@ fn run_app() -> Result<()> {
                     }
                 }
             }
+            Event::UserEvent(UserEvent::RuntimeFailed(error_message)) => {
+                runtime_ready = false;
+                let script = runtime_failed_script(&error_message);
+                for webview in content_webviews.values() {
+                    if let Err(error) = webview.evaluate_script(&script) {
+                        eprintln!(
+                            "could not notify content webview about runtime failure: {error:#}"
+                        );
+                    }
+                }
+            }
             Event::LoopDestroyed => {
                 stop_runtime(&app_state);
             }
             Event::WindowEvent {
                 event: WindowEvent::Resized(_),
+                window_id,
                 ..
-            } => {
+            } if window_id == main_window_id => {
                 let (width, height) = logical_window_size(&window);
                 if let Err(error) = shell_webview.set_bounds(top_bar_bounds(width)) {
                     eprintln!("could not resize shell webview: {error:#}");
@@ -499,10 +1171,18 @@ fn run_app() -> Result<()> {
             }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
+                window_id,
                 ..
             } => {
-                stop_runtime(&app_state);
-                *control_flow = ControlFlow::Exit;
+                if download_manager_window
+                    .as_ref()
+                    .is_some_and(|manager| manager.window.id() == window_id)
+                {
+                    download_manager_window = None;
+                } else if window_id == main_window_id {
+                    stop_runtime(&app_state);
+                    *control_flow = ControlFlow::Exit;
+                }
             }
             _ => {}
         }
@@ -534,13 +1214,18 @@ fn site_initial_url(settings: &AppSettings, site: AiSite, runtime_ready: bool) -
             return site.url().to_string();
         }
 
-        waiting_page_url(site.title())
+        waiting_page_url(site)
     } else {
         site.url().to_string()
     }
 }
 
-fn waiting_page_url(site_title: &str) -> String {
+fn waiting_page_url(site: AiSite) -> String {
+    let startup_stage_keys = StartupStage::all()
+        .iter()
+        .map(|stage| stage.key())
+        .collect::<Vec<_>>()
+        .join(",");
     let html = r#"<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -552,16 +1237,42 @@ fn waiting_page_url(site_title: &str) -> String {
     main { width: min(520px, calc(100vw - 40px)); }
     h1 { margin: 0 0 10px; font-size: 24px; }
     p { margin: 6px 0; color: #555; }
+    .status { margin: 14px 0; padding: 12px; border: 1px solid #d9dde3; border-radius: 8px; background: #f7f8fa; }
+    .actions { display: none; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+    .actions[data-visible="true"] { display: flex; }
+    button { border: 1px solid #cfd5df; border-radius: 7px; background: #fff; padding: 7px 10px; cursor: pointer; }
   </style>
 </head>
 <body>
   <main>
     <h1>正在启动内置代理</h1>
     <p>代理就绪后会自动打开 __SITE_TITLE__。右下角“设”可以查看订阅、节点和日志。</p>
+    <div class="status" data-startup-stages="__STARTUP_STAGE_KEYS__">
+      <p>当前步骤：<strong data-startup-stage>读取配置</strong></p>
+      <p>已用时：<span data-startup-elapsed>0</span>s</p>
+      <p data-startup-message></p>
+    </div>
+    <div class="actions" data-startup-actions data-visible="false">
+      <button type="button" onclick="window.location.reload()">重试代理</button>
+      <button type="button" onclick="window.location.href='__SITE_URL__'">跳过代理打开</button>
+      <button type="button" onclick="window.location.href='__SITE_URL__'">继续打开</button>
+    </div>
   </main>
+  <script>
+    const startupStartedAt = Date.now();
+    setInterval(() => {
+      const elapsed = document.querySelector('[data-startup-elapsed]');
+      if (elapsed) elapsed.textContent = String(Math.floor((Date.now() - startupStartedAt) / 1000));
+    }, 1000);
+    setTimeout(() => {
+      document.querySelector('[data-startup-actions]')?.setAttribute('data-visible', 'true');
+    }, 15000);
+  </script>
 </body>
 </html>"#
-        .replace("__SITE_TITLE__", site_title);
+        .replace("__SITE_TITLE__", site.title())
+        .replace("__SITE_URL__", site.url())
+        .replace("__STARTUP_STAGE_KEYS__", &startup_stage_keys);
     format!("data:text/html;charset=utf-8,{}", encode(&html))
 }
 
@@ -575,6 +1286,70 @@ fn runtime_ready_script_for_site(site: AiSite) -> String {
       }
     "#
     .replace("__SITE_URL__", site.url())
+}
+
+fn runtime_failed_script(error_message: &str) -> String {
+    let payload = json!({
+        "title": "内置代理启动失败",
+        "message": error_message,
+        "hint": "请确认程序目录里存在 resources\\clash\\mihomo.exe，或重新解压完整便携版目录后启动。",
+    });
+    format!(
+        r#"
+(() => {{
+  const payload = {payload};
+  const isWaitingPage = window.location.href.startsWith('data:text/html') || window.location.href === 'about:blank';
+  if (!isWaitingPage) {{
+    window.__chatgptClientReceive && window.__chatgptClientReceive({{
+      id: null,
+      ok: false,
+      error: payload.message
+    }});
+    return;
+  }}
+  document.body.innerHTML = '';
+  document.body.style.cssText = 'margin:0;min-height:100vh;display:grid;place-items:center;background:#fff;color:#111;font:16px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;';
+  const main = document.createElement('main');
+  main.style.cssText = 'width:min(680px,calc(100vw - 40px));';
+  const title = document.createElement('h1');
+  title.textContent = payload.title;
+  title.style.cssText = 'margin:0 0 10px;font-size:24px;';
+  const message = document.createElement('pre');
+  message.textContent = payload.message;
+  message.style.cssText = 'white-space:pre-wrap;margin:12px 0;padding:12px;border:1px solid #ddd;border-radius:8px;background:#f7f7f8;color:#333;font:13px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace;';
+  const hint = document.createElement('p');
+  hint.textContent = payload.hint;
+  hint.style.cssText = 'margin:6px 0;color:#555;';
+  main.append(title, hint, message);
+  document.body.appendChild(main);
+}})();
+"#
+    )
+}
+
+fn startup_progress_script(progress: &StartupProgress) -> String {
+    let payload = json!({
+        "stage": progress.stage.key(),
+        "label": progress.stage.label(),
+        "elapsed_secs": progress.elapsed_secs,
+        "message": progress.message,
+    });
+    format!(
+        r#"
+(() => {{
+  const payload = {payload};
+  const stage = document.querySelector('[data-startup-stage]');
+  const elapsed = document.querySelector('[data-startup-elapsed]');
+  const message = document.querySelector('[data-startup-message]');
+  if (stage) stage.textContent = payload.label || payload.stage || '';
+  if (elapsed) elapsed.textContent = String(payload.elapsed_secs || 0);
+  if (message) message.textContent = payload.message || '';
+  if (payload.stage === 'failed') {{
+    document.querySelector('[data-startup-actions]')?.setAttribute('data-visible', 'true');
+  }}
+}})();
+"#
+    )
 }
 
 fn top_bar_bounds(width: f64) -> wry::Rect {
@@ -641,16 +1416,62 @@ fn build_content_webview(
     event_proxy: EventLoopProxy<UserEvent>,
 ) -> Result<WebView> {
     let target = IpcTarget::Site(site);
+    let download_started_proxy = event_proxy.clone();
+    let download_completed_proxy = event_proxy.clone();
+    let native_download_settings = settings.downloads.clone();
     let builder = WebViewBuilder::new_with_web_context(web_context)
         .with_url(site_initial_url(settings, site, runtime_ready))
         .with_bounds(bounds)
         .with_visible(visible)
+        .with_initialization_script(download_interceptor_script())
         .with_initialization_script(settings_button_script(settings_json))
         .with_ipc_handler(move |request| {
             let _ = event_proxy.send_event(UserEvent::Ipc {
                 target,
                 body: request.body().to_string(),
             });
+        })
+        .with_download_started_handler(move |url, path| {
+            let destination =
+                download_destination_for_with_settings(path, &native_download_settings);
+            eprintln!("download started: {url} -> {}", destination.display());
+            *path = destination;
+            let _ = download_started_proxy.send_event(UserEvent::DownloadEvent(DownloadEvent {
+                kind: DownloadEventKind::Started,
+                status: "下载已开始".to_string(),
+                path: Some(path.clone()),
+                url: Some(url),
+                bytes: None,
+                success: true,
+            }));
+            true
+        })
+        .with_download_completed_handler(move |url, path, success| {
+            if success {
+                if let Some(path) = &path {
+                    eprintln!("download completed: {url} -> {}", path.display());
+                } else {
+                    eprintln!("download completed: {url}");
+                }
+            } else {
+                eprintln!("download failed: {url}");
+            }
+            let _ = download_completed_proxy.send_event(UserEvent::DownloadEvent(DownloadEvent {
+                kind: if success {
+                    DownloadEventKind::Completed
+                } else {
+                    DownloadEventKind::Failed
+                },
+                status: if success {
+                    "下载完成".to_string()
+                } else {
+                    "下载失败".to_string()
+                },
+                path,
+                url: Some(url),
+                bytes: None,
+                success,
+            }));
         })
         .with_new_window_req_handler(|_url, _features| NewWindowResponse::Allow);
 
@@ -793,6 +1614,254 @@ fn sync_shell_tabs(
     let script = shell_tab_sync_script(active_site, &loaded_sites(content_webviews));
     if let Err(error) = shell_webview.evaluate_script(&script) {
         eprintln!("could not sync top tab state: {error:#}");
+    }
+}
+
+fn sync_downloads(shell_webview: &WebView, history: &DownloadHistory) {
+    let payload = history.payload();
+    let script =
+        format!("window.__aiClientSyncDownloads && window.__aiClientSyncDownloads({payload});");
+    if let Err(error) = shell_webview.evaluate_script(&script) {
+        eprintln!("could not sync download state: {error:#}");
+    }
+}
+
+fn download_manager_html(history: &DownloadHistory) -> String {
+    let initial_payload = history.payload();
+    format!(
+        r#"<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>下载管理</title>
+  <style>
+    :root {{ --surface: #fff; --surface-muted: #f5f6f8; --line: #d9dde3; --line-strong: #a8b0bd; --text: #15181d; --muted: #687080; --ok: #0b7a3b; --bad: #9b1c1c; --blue: #2457b0; }}
+    * {{ box-sizing: border-box; }}
+    html, body {{ width: 100%; height: 100%; margin: 0; overflow: hidden; background: var(--surface); color: var(--text); font: 13px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    button, input {{ font: inherit; }}
+    body {{ display: grid; grid-template-rows: auto auto minmax(0, 1fr); }}
+    header {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 18px 12px; border-bottom: 1px solid var(--line); }}
+    h1 {{ margin: 0; font-size: 18px; font-weight: 700; letter-spacing: 0; }}
+    .hint {{ color: var(--muted); margin-top: 3px; }}
+    .actions {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }}
+    .toolbar {{ display: grid; grid-template-columns: minmax(180px, 420px) auto; gap: 12px; align-items: center; padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--surface-muted); }}
+    .search {{ width: 100%; height: 34px; border: 1px solid var(--line); border-radius: 7px; padding: 0 10px; background: #fff; color: var(--text); outline: none; }}
+    .search:focus {{ border-color: var(--line-strong); }}
+    .summary {{ justify-self: end; color: var(--muted); white-space: nowrap; }}
+    .btn {{ min-height: 32px; border: 1px solid var(--line); border-radius: 7px; background: #fff; color: var(--text); padding: 0 10px; cursor: pointer; }}
+    .btn:hover {{ border-color: var(--line-strong); background: #eef1f5; }}
+    .btn.primary {{ background: #15181d; color: #fff; border-color: #15181d; }}
+    .content {{ min-height: 0; overflow: auto; padding: 12px 18px 18px; }}
+    .empty {{ display: none; place-items: center; min-height: 220px; color: var(--muted); border: 1px dashed var(--line); border-radius: 8px; background: #fafbfc; }}
+    .empty[data-visible="true"] {{ display: grid; }}
+    .list {{ display: grid; gap: 10px; }}
+    .download-row {{ display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; align-items: center; border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: #fff; }}
+    .download-row:hover {{ border-color: var(--line-strong); }}
+    .name-row {{ display: flex; align-items: center; gap: 8px; min-width: 0; }}
+    .name {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 650; }}
+    .status {{ flex: 0 0 auto; border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; color: var(--muted); font-size: 12px; }}
+    .status[data-status="completed"] {{ border-color: #b8dbc7; color: var(--ok); }}
+    .status[data-status="failed"], .status[data-status="cancelled"] {{ border-color: #f0b7b7; color: var(--bad); }}
+    .status[data-status="started"] {{ border-color: #c9d9fb; color: var(--blue); }}
+    .meta, .path {{ margin-top: 4px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .path {{ font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }}
+    .row-actions {{ display: flex; align-items: center; gap: 6px; }}
+    .row-actions .btn {{ min-height: 30px; padding-inline: 9px; }}
+    @media (max-width: 760px) {{
+      header, .toolbar {{ display: flex; align-items: stretch; flex-direction: column; }}
+      .actions, .summary {{ justify-content: flex-start; justify-self: start; }}
+      .download-row {{ grid-template-columns: minmax(0, 1fr); }}
+      .row-actions {{ flex-wrap: wrap; }}
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>下载管理</h1>
+      <div class="hint">查看下载记录、打开文件位置或调整保存路径。</div>
+    </div>
+    <div class="actions">
+      <button class="btn" type="button" data-action="openDownloadSettings">保存路径设置</button>
+      <button class="btn" type="button" data-action="clearCompletedDownloads">清除已完成</button>
+      <button class="btn primary" type="button" data-action="closeDownloadManager">关闭</button>
+    </div>
+  </header>
+  <section class="toolbar" aria-label="下载筛选">
+    <input class="search" type="search" placeholder="搜索文件名、路径或来源" data-download-filter>
+    <div class="summary" data-download-summary>0 个下载记录</div>
+  </section>
+  <main class="content">
+    <div class="empty" data-download-empty data-visible="false">暂无下载记录</div>
+    <div class="list" data-download-list></div>
+  </main>
+  <script>
+    let downloads = [];
+    let requestSeq = 0;
+    const filterInput = document.querySelector('[data-download-filter]');
+    const list = document.querySelector('[data-download-list]');
+    const empty = document.querySelector('[data-download-empty]');
+    const summary = document.querySelector('[data-download-summary]');
+
+    function sendCommand(type, payload = {{}}) {{
+      if (!window.ipc || typeof window.ipc.postMessage !== 'function') return;
+      window.ipc.postMessage(JSON.stringify({{ id: String(++requestSeq), type, payload }}));
+    }}
+    function escapeHtml(value) {{
+      return String(value ?? '').replace(/[&<>"']/g, ch => ({{ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }}[ch]));
+    }}
+    function statusLabel(status) {{
+      switch (status) {{
+        case 'started': return '下载中';
+        case 'completed': return '已完成';
+        case 'failed': return '失败';
+        case 'diagnostic': return '诊断';
+        case 'cancelled': return '已取消';
+        case 'missing': return '文件缺失';
+        default: return status || '-';
+      }}
+    }}
+    function formatBytes(bytes) {{
+      if (!Number.isFinite(bytes) || bytes <= 0) return '';
+      const units = ['B', 'KB', 'MB', 'GB'];
+      let value = bytes;
+      let unit = 0;
+      while (value >= 1024 && unit < units.length - 1) {{ value /= 1024; unit += 1; }}
+      return `${{value.toFixed(unit === 0 ? 0 : 1)}} ${{units[unit]}}`;
+    }}
+    function formatTime(timestamp) {{
+      const value = Number(timestamp);
+      if (!Number.isFinite(value) || value <= 0) return '';
+      try {{ return new Date(value).toLocaleString(); }} catch (_) {{ return ''; }}
+    }}
+    function currentFilter() {{
+      return (filterInput?.value || '').trim().toLowerCase();
+    }}
+    function filteredDownloads() {{
+      const query = currentFilter();
+      if (!query) return downloads;
+      return downloads.filter(item => [item.filename, item.path, item.url, item.message, item.status]
+        .some(value => String(value || '').toLowerCase().includes(query)));
+    }}
+    function render() {{
+      const items = filteredDownloads();
+      const completed = downloads.filter(item => item.status === 'completed').length;
+      const failed = downloads.filter(item => item.status === 'failed').length;
+      summary.textContent = `${{downloads.length}} 个记录，${{completed}} 个完成，${{failed}} 个失败`;
+      empty.dataset.visible = String(items.length === 0);
+      list.innerHTML = items.map(item => {{
+        const path = item.path || '';
+        const meta = [formatTime(item.timestamp_ms), formatBytes(item.bytes), item.message || item.url || ''].filter(Boolean).join(' · ');
+        const openDisabled = path ? '' : ' disabled';
+        return `<article class="download-row" data-download-id="${{item.id}}">
+          <div class="download-main">
+            <div class="name-row">
+              <div class="name" title="${{escapeHtml(item.filename || 'download')}}">${{escapeHtml(item.filename || 'download')}}</div>
+              <span class="status" data-status="${{escapeHtml(item.status || 'missing')}}">${{escapeHtml(statusLabel(item.status))}}</span>
+            </div>
+            <div class="meta" title="${{escapeHtml(meta)}}">${{escapeHtml(meta || '-')}}</div>
+            <div class="path" title="${{escapeHtml(path || item.url || '')}}">${{escapeHtml(path || item.url || '无本地路径')}}</div>
+          </div>
+          <div class="row-actions">
+            <button class="btn" type="button" data-action="openDownloadPath" data-path="${{escapeHtml(path)}}"${{openDisabled}}>打开文件</button>
+            <button class="btn" type="button" data-action="openDownloadFolder" data-path="${{escapeHtml(path)}}"${{openDisabled}}>打开目录</button>
+            <button class="btn" type="button" data-action="deleteDownloadRecord" data-id="${{item.id}}">删除记录</button>
+          </div>
+        </article>`;
+      }}).join('');
+    }}
+    window.__aiClientSyncDownloads = (payload = {{}}) => {{
+      downloads = Array.isArray(payload.downloads) ? payload.downloads : [];
+      render();
+    }};
+    filterInput?.addEventListener('input', render);
+    document.addEventListener('click', event => {{
+      const button = event.target.closest('[data-action]');
+      if (!button) return;
+      const action = button.dataset.action;
+      if (action === 'openDownloadPath') sendCommand(action, {{ path: button.dataset.path || '' }});
+      else if (action === 'openDownloadFolder') sendCommand(action, {{ path: button.dataset.path || '' }});
+      else if (action === 'deleteDownloadRecord') sendCommand(action, {{ id: Number(button.dataset.id || 0) }});
+      else sendCommand(action);
+    }});
+    window.addEventListener('keydown', event => {{
+      if (event.key === 'Escape') sendCommand('closeDownloadManager');
+    }});
+    window.__aiClientSyncDownloads({initial_payload});
+  </script>
+</body>
+</html>"#
+    )
+}
+
+fn open_download_manager_window(
+    download_manager_window: &mut Option<DownloadManagerWindow>,
+    event_loop: &EventLoopWindowTarget<UserEvent>,
+    event_proxy: EventLoopProxy<UserEvent>,
+    history: &DownloadHistory,
+) -> Result<()> {
+    if let Some(manager) = download_manager_window.as_ref() {
+        manager.window.set_visible(true);
+        manager.window.set_focus();
+        sync_download_manager_window(download_manager_window, history);
+        return Ok(());
+    }
+
+    let window = WindowBuilder::new()
+        .with_title("下载管理")
+        .with_inner_size(LogicalSize::new(980.0, 720.0))
+        .with_min_inner_size(LogicalSize::new(720.0, 480.0))
+        .build(event_loop)
+        .context("could not create download manager window")?;
+    let builder = WebViewBuilder::new()
+        .with_html(download_manager_html(history))
+        .with_ipc_handler(move |request| {
+            let _ = event_proxy.send_event(UserEvent::Ipc {
+                target: IpcTarget::DownloadManager,
+                body: request.body().to_string(),
+            });
+        });
+
+    #[cfg(windows)]
+    let builder = apply_windows_diagnostics(builder, None);
+
+    let webview = builder
+        .build(&window)
+        .context("could not build download manager webview")?;
+    window.set_focus();
+
+    *download_manager_window = Some(DownloadManagerWindow { window, webview });
+    sync_download_manager_window(download_manager_window, history);
+
+    Ok(())
+}
+
+fn sync_download_manager_window(
+    download_manager_window: &Option<DownloadManagerWindow>,
+    history: &DownloadHistory,
+) {
+    let Some(manager) = download_manager_window.as_ref() else {
+        return;
+    };
+    let payload = history.payload();
+    let script =
+        format!("window.__aiClientSyncDownloads && window.__aiClientSyncDownloads({payload});");
+    if let Err(error) = manager.webview.evaluate_script(&script) {
+        eprintln!("could not sync download manager state: {error:#}");
+    }
+}
+
+fn sync_download_settings_last_dir(content_webviews: &HashMap<AiSite, WebView>, last_dir: &str) {
+    let payload = json!({ "last_dir": last_dir });
+    let script = format!(
+        "window.__chatgptClientUpdateDownloadSettings && window.__chatgptClientUpdateDownloadSettings({payload});"
+    );
+
+    for webview in content_webviews.values() {
+        if let Err(error) = webview.evaluate_script(&script) {
+            eprintln!("could not sync download settings: {error:#}");
+        }
     }
 }
 
@@ -1014,11 +2083,21 @@ fn top_shell_html(active_site: AiSite) -> String {
     .actions { display: flex; align-items: center; gap: 6px; min-width: 0; }
     .top-status { display: flex; align-items: center; gap: 7px; padding-right: 4px; }
     .pill { display: inline-flex; align-items: center; gap: 6px; min-height: 28px; border: 1px solid var(--line); border-radius: 999px; background: rgba(255,255,255,.76); padding: 0 10px; color: var(--muted); white-space: nowrap; }
+    .latency-pill { flex: 0 0 auto; min-width: 104px; justify-content: center; overflow: visible; }
+    .pill[data-health="good"] { border-color: #b8dbc7; color: #0b7a3b; }
+    .pill[data-health="bad"] { border-color: #f0b7b7; color: #9b1c1c; }
     .pill strong { color: var(--text); font-weight: 650; }
     .toolbar-divider { width: 1px; height: 24px; background: var(--line); margin: 0 4px; }
     .icon-btn { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); cursor: pointer; }
     .icon-btn:hover { border-color: var(--line-strong); background: var(--surface-muted); }
     .icon-btn svg { width: 17px; height: 17px; stroke: currentColor; stroke-width: 2; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+    .toast-region { position: fixed; right: 12px; top: 8px; z-index: 30; display: grid; gap: 8px; width: min(360px, calc(100vw - 24px)); pointer-events: none; }
+    .toast { border: 1px solid var(--line); border-radius: 8px; background: rgba(255,255,255,.98); box-shadow: 0 10px 28px rgba(22,31,45,.16); padding: 7px 10px; color: var(--text); animation: toast-in .16s ease-out; }
+    .toast[data-success="false"] { border-color: #f0b7b7; }
+    .toast-title { font-weight: 650; }
+    .toast-path { display: block; width: 100%; margin: 3px 0 0; border: 0; background: transparent; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; text-align: left; cursor: pointer; padding: 0; pointer-events: auto; }
+    .toast-path:hover { color: var(--text); text-decoration: underline; }
+    @keyframes toast-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
     @media (max-width: 820px) {
       .topbar { grid-template-columns: minmax(0, 1fr) auto; gap: 8px; padding-inline: 8px; }
       .tab { min-width: 94px; padding-inline: 8px; }
@@ -1033,6 +2112,7 @@ fn top_shell_html(active_site: AiSite) -> String {
     </nav>
     <div class="actions" aria-label="Page actions">
       <div class="top-status" aria-label="Current status">
+        <span class="pill latency-pill" data-latency-label data-health="unknown">延时 --</span>
         <span class="pill"><strong>已登录</strong></span>
         <span class="pill"><strong>代理可用</strong></span>
         <span class="pill"><strong>页面常驻</strong></span>
@@ -1041,9 +2121,13 @@ fn top_shell_html(active_site: AiSite) -> String {
       <button class="icon-btn" type="button" title="后退" aria-label="后退" data-action="navBack"><svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"></path></svg></button>
       <button class="icon-btn" type="button" title="前进" aria-label="前进" data-action="navForward"><svg viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"></path></svg></button>
       <button class="icon-btn" type="button" title="刷新" aria-label="刷新" data-action="reloadActive"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.64-6.36"></path><path d="M21 4v6h-6"></path></svg></button>
+      <button class="icon-btn" type="button" title="导出 Markdown" aria-label="导出 Markdown" data-action="exportMarkdown"><svg viewBox="0 0 24 24"><path d="M4 4h16v16H4z"></path><path d="M7 16V8l3 4 3-4v8"></path><path d="M17 8v8"></path><path d="M15 14l2 2 2-2"></path></svg></button>
+      <button class="icon-btn" type="button" title="导出 PDF" aria-label="导出 PDF" data-action="exportPdf"><svg viewBox="0 0 24 24"><path d="M6 3h9l3 3v15H6z"></path><path d="M14 3v4h4"></path><path d="M8 16h8"></path><path d="M8 12h8"></path></svg></button>
+      <button class="icon-btn" type="button" title="下载管理" aria-label="下载管理" data-action="openDownloadManager"><svg viewBox="0 0 24 24"><path d="M12 3v10"></path><path d="M8 9l4 4 4-4"></path><path d="M4 17h16"></path><path d="M6 21h12"></path></svg></button>
       <button class="icon-btn" type="button" title="清理内存" aria-label="清理内存" data-action="optimizeMemory"><svg viewBox="0 0 24 24"><path d="M3 17h18"></path><path d="M5 17l2-10h10l2 10"></path><path d="M8 21h8"></path><path d="M9 7V3h6v4"></path></svg></button>
     </div>
   </header>
+  <div class="toast-region" aria-live="polite" aria-atomic="true"></div>
   <script>
     const started = new Set(['__ACTIVE_SITE__']);
     let activeSite = '__ACTIVE_SITE__';
@@ -1076,12 +2160,58 @@ fn top_shell_html(active_site: AiSite) -> String {
       setActive(activeSite);
       sendCommand('optimizeMemory');
     }
+    function measureActiveLatency() {
+      const label = document.querySelector('[data-latency-label]');
+      if (label) {
+        label.textContent = '延时 ...';
+        label.dataset.health = 'unknown';
+      }
+      sendCommand('measureLatency', { site: activeSite });
+    }
     window.__aiClientSyncTabs = (active, loaded) => {
       started.clear();
       (Array.isArray(loaded) ? loaded : ['chatgpt']).forEach(site => started.add(site));
       started.add('chatgpt');
       activeSite = active || 'chatgpt';
       setActive(activeSite);
+      measureActiveLatency();
+    };
+    window.__aiClientUpdateLatency = ({ site, delay_ms, success } = {}) => {
+      if (site && site !== activeSite) return;
+      const label = document.querySelector('[data-latency-label]');
+      if (!label) return;
+      if (success && Number.isFinite(delay_ms)) {
+        label.textContent = `延时 ${delay_ms}ms`;
+        label.dataset.health = delay_ms < 3000 ? 'good' : 'bad';
+      } else {
+        label.textContent = '延时失败';
+        label.dataset.health = 'bad';
+      }
+    };
+    window.__aiClientNotifyDownload = ({ status, path, success } = {}) => {
+      const region = document.querySelector('.toast-region');
+      if (!region) return;
+      const toast = document.createElement('div');
+      toast.className = 'toast';
+      toast.dataset.success = String(success !== false);
+      const title = document.createElement('div');
+      title.className = 'toast-title';
+      title.textContent = status || '下载状态';
+      toast.appendChild(title);
+      if (path) {
+        const detail = document.createElement('button');
+        detail.type = 'button';
+        detail.className = 'toast-path';
+        detail.dataset.action = 'openDownloadPath';
+        detail.dataset.path = path;
+        detail.title = path;
+        detail.textContent = path;
+        detail.addEventListener('click', () => sendCommand('openDownloadPath', { path }));
+        toast.appendChild(detail);
+      }
+      region.appendChild(toast);
+      while (region.children.length > 3) region.firstElementChild.remove();
+      setTimeout(() => toast.remove(), 5200);
     };
     document.querySelectorAll('.tab').forEach(tab => {
       tab.addEventListener('click', event => {
@@ -1089,6 +2219,7 @@ fn top_shell_html(active_site: AiSite) -> String {
         const site = tab.dataset.site;
         setActive(site);
         sendCommand('switchSite', { site });
+        measureActiveLatency();
       });
       tab.addEventListener('keydown', event => {
         if (!['Enter', ' '].includes(event.key)) return;
@@ -1096,6 +2227,7 @@ fn top_shell_html(active_site: AiSite) -> String {
         const site = tab.dataset.site;
         setActive(site);
         sendCommand('switchSite', { site });
+        measureActiveLatency();
       });
     });
     document.querySelectorAll('.tab-close').forEach(button => {
@@ -1107,6 +2239,9 @@ fn top_shell_html(active_site: AiSite) -> String {
     document.querySelectorAll('.actions [data-action]').forEach(button => {
       button.addEventListener('click', () => {
         if (button.dataset.action === 'optimizeMemory') optimizeMemory();
+        else if (button.dataset.action === 'openDownloadManager') sendCommand('openDownloadManager');
+        else if (button.dataset.action === 'exportMarkdown') sendCommand('exportConversation', { format: 'markdown' });
+        else if (button.dataset.action === 'exportPdf') sendCommand('exportConversation', { format: 'pdf' });
         else sendCommand(button.dataset.action);
       });
     });
@@ -1115,8 +2250,525 @@ fn top_shell_html(active_site: AiSite) -> String {
         const site = ['chatgpt', 'gemini', 'notebooklm', 'aistudio'][Number(event.key) - 1];
         setActive(site);
         sendCommand('switchSite', { site });
+        measureActiveLatency();
       }
     });
+    setTimeout(measureActiveLatency, 5000);
+    setInterval(measureActiveLatency, 60000);
+  </script>
+</body>
+</html>"#;
+
+    html.replace("__TABS__", &tabs)
+        .replace("__ACTIVE_SITE__", active_site.key())
+}
+
+#[allow(dead_code)]
+fn top_shell_html_legacy(active_site: AiSite) -> String {
+    let tabs = AiSite::all()
+        .iter()
+        .enumerate()
+        .map(|(index, site)| {
+            let close_button = if *site == AiSite::ChatGpt {
+                String::new()
+            } else {
+                format!(
+                    r#"<button class="tab-close" type="button" title="关闭 {}" aria-label="关闭 {}" data-action="closeSite" data-site="{}">×</button>"#,
+                    site.title(),
+                    site.title(),
+                    site.key()
+                )
+            };
+            format!(
+                r#"<div class="tab" role="button" tabindex="0" data-site="{}" data-active="{}" data-started="{}">
+          <span class="tab-dot"></span>
+          <span class="tab-name">{}</span>
+          <span class="tab-shortcut">{}</span>
+          {}
+        </div>"#,
+                site.key(),
+                *site == active_site,
+                *site == active_site,
+                site.title(),
+                index + 1,
+                close_button
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n        ");
+
+    let html = r#"<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root { --surface: #fff; --surface-muted: #f0f2f5; --line: #d9dde3; --line-strong: #a8b0bd; --text: #15181d; --muted: #687080; --ok: #0b7a3b; }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: transparent; color: var(--text); font: 13px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    button { font: inherit; }
+    .topbar { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; height: 52px; border-bottom: 1px solid var(--line); background: rgba(255,255,255,.96); padding: 8px 12px; }
+    .tabs { display: flex; align-items: center; gap: 7px; min-width: 0; overflow: auto; scrollbar-width: none; }
+    .tabs::-webkit-scrollbar { display: none; }
+    .tab { display: inline-grid; grid-template-columns: auto minmax(0, auto) auto auto; align-items: center; gap: 7px; min-width: 116px; height: 36px; border: 1px solid transparent; border-radius: 8px; background: transparent; color: var(--muted); padding: 0 7px 0 10px; cursor: pointer; white-space: nowrap; }
+    .tab:hover { background: var(--surface-muted); color: var(--text); }
+    .tab[data-active="true"] { border-color: var(--line); background: var(--surface); color: var(--text); box-shadow: 0 4px 14px rgba(22,31,45,.08); }
+    .tab-dot { width: 8px; height: 8px; border-radius: 999px; background: var(--line-strong); }
+    .tab[data-started="true"] .tab-dot { background: var(--ok); }
+    .tab-name { overflow: hidden; text-overflow: ellipsis; }
+    .tab-shortcut { color: var(--muted); font-size: 11px; }
+    .tab-close { display: grid; place-items: center; width: 22px; height: 22px; border: 0; border-radius: 999px; background: transparent; color: var(--muted); cursor: pointer; font-size: 17px; line-height: 1; }
+    .tab-close:hover { background: #e5e9ef; color: var(--text); }
+    .tab[data-started="false"] .tab-close { display: none; }
+    .actions { display: flex; align-items: center; gap: 6px; min-width: 0; }
+    .top-status { display: flex; align-items: center; gap: 7px; padding-right: 4px; }
+    .pill { display: inline-flex; align-items: center; gap: 6px; min-height: 28px; border: 1px solid var(--line); border-radius: 999px; background: rgba(255,255,255,.76); padding: 0 10px; color: var(--muted); white-space: nowrap; }
+    .latency-pill { flex: 0 0 auto; min-width: 104px; justify-content: center; overflow: visible; }
+    .pill[data-health="good"] { border-color: #b8dbc7; color: #0b7a3b; }
+    .pill[data-health="bad"] { border-color: #f0b7b7; color: #9b1c1c; }
+    .pill strong { color: var(--text); font-weight: 650; }
+    .toolbar-divider { width: 1px; height: 24px; background: var(--line); margin: 0 4px; }
+    .icon-btn { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--text); cursor: pointer; }
+    .icon-btn:hover { border-color: var(--line-strong); background: var(--surface-muted); }
+    .icon-btn svg { width: 17px; height: 17px; stroke: currentColor; stroke-width: 2; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+    .toast-region { position: fixed; right: 12px; top: 8px; z-index: 30; display: grid; gap: 8px; width: min(360px, calc(100vw - 24px)); pointer-events: none; }
+    .toast { border: 1px solid var(--line); border-radius: 8px; background: rgba(255,255,255,.98); box-shadow: 0 10px 28px rgba(22,31,45,.16); padding: 7px 10px; color: var(--text); animation: toast-in .16s ease-out; }
+    .toast[data-success="false"] { border-color: #f0b7b7; }
+    .toast-title { font-weight: 650; }
+    .toast-path { display: block; width: 100%; margin: 3px 0 0; border: 0; background: transparent; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; text-align: left; cursor: pointer; padding: 0; pointer-events: auto; }
+    .toast-path:hover { color: var(--text); text-decoration: underline; }
+    .download-overlay { position: fixed; inset: 0; z-index: 40; display: none; align-items: center; justify-content: center; padding: 16px; background: rgba(18, 24, 34, .34); backdrop-filter: blur(3px); }
+    .download-overlay[data-open="true"] { display: flex; }
+    .download-panel { width: min(980px, calc(100vw - 32px)); height: min(82vh, 760px); border: 1px solid var(--line); border-radius: 8px; background: rgba(255,255,255,.99); box-shadow: 0 24px 72px rgba(22,31,45,.28); overflow: hidden; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
+    .download-head { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 320px) auto; align-items: center; gap: 10px; padding: 12px 14px; border-bottom: 1px solid var(--line); background: rgba(255,255,255,.98); }
+    .download-head-main { display: grid; gap: 2px; min-width: 0; }
+    .download-title { font-weight: 650; }
+    .download-summary { color: var(--muted); font-size: 12px; }
+    .download-search { width: 100%; min-height: 32px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); padding: 0 10px; color: var(--text); }
+    .download-search:focus { outline: 2px solid rgba(27, 111, 237, .18); outline-offset: 1px; border-color: #9db6dd; }
+    .download-head-actions { display: flex; align-items: center; gap: 6px; justify-content: flex-end; min-width: 0; overflow: auto; scrollbar-width: none; }
+    .download-head-actions::-webkit-scrollbar { display: none; }
+    .download-body { overflow: auto; padding: 0; display: block; background: #fff; }
+    .download-empty { color: var(--muted); padding: 28px 12px; text-align: center; }
+    .download-item { display: grid; grid-template-columns: 42px minmax(0, 1fr) auto; gap: 12px; align-items: center; min-height: 84px; border-bottom: 1px solid #edf0f3; padding: 10px 14px; background: var(--surface); }
+    .download-item:hover { background: #fafbfc; }
+    .download-row-icon { display: grid; place-items: center; width: 34px; height: 42px; color: #6a7280; }
+    .download-row-icon svg { width: 32px; height: 32px; stroke: currentColor; stroke-width: 1.7; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+    .download-main { min-width: 0; display: grid; gap: 4px; }
+    .download-name-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .download-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+    .download-status { flex: 0 0 auto; display: inline-flex; align-items: center; min-height: 22px; border-radius: 999px; border: 1px solid var(--line); padding: 0 8px; color: var(--muted); font-size: 12px; }
+    .download-status[data-status="completed"] { border-color: #b8dbc7; color: #0b7a3b; }
+    .download-status[data-status="failed"] { border-color: #f0b7b7; color: #9b1c1c; }
+    .download-status[data-status="started"] { border-color: #c9d9fb; color: #2457b0; }
+    .download-status[data-status="diagnostic"], .download-status[data-status="missing"] { border-color: #dde3ea; color: #6a7280; }
+    .download-meta, .download-path { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .download-path { cursor: default; }
+    .download-actions { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+    .download-link, .text-btn { border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--text); cursor: pointer; padding: 5px 8px; }
+    .download-icon-action { display: grid; place-items: center; width: 34px; height: 34px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); cursor: pointer; }
+    .download-icon-action:hover { background: var(--surface-muted); color: var(--text); }
+    .download-icon-action svg { width: 22px; height: 22px; stroke: currentColor; stroke-width: 1.8; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+    .download-link:hover, .text-btn:hover { background: var(--surface-muted); }
+    .download-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 12px; border-top: 1px solid var(--line); background: rgba(255,255,255,.98); }
+    @keyframes toast-in { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+    @media (max-width: 820px) {
+      .topbar { grid-template-columns: minmax(0, 1fr) auto; gap: 8px; padding-inline: 8px; }
+      .tab { min-width: 94px; padding-inline: 8px; }
+      .tab-shortcut, .top-status, .toolbar-divider { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <nav class="tabs" aria-label="AI pages">
+      __TABS__
+    </nav>
+    <div class="actions" aria-label="Page actions">
+      <div class="top-status" aria-label="Current status">
+        <span class="pill latency-pill" data-latency-label data-health="unknown">延时 --</span>
+        <span class="pill"><strong>已登录</strong></span>
+        <span class="pill"><strong>代理可用</strong></span>
+        <span class="pill"><strong>页面常驻</strong></span>
+      </div>
+      <span class="toolbar-divider" aria-hidden="true"></span>
+      <button class="icon-btn" type="button" title="后退" aria-label="后退" data-action="navBack"><svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"></path></svg></button>
+      <button class="icon-btn" type="button" title="前进" aria-label="前进" data-action="navForward"><svg viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"></path></svg></button>
+      <button class="icon-btn" type="button" title="刷新" aria-label="刷新" data-action="reloadActive"><svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.64-6.36"></path><path d="M21 4v6h-6"></path></svg></button>
+      <button class="icon-btn" type="button" title="导出 Markdown" aria-label="导出 Markdown" data-action="exportMarkdown"><svg viewBox="0 0 24 24"><path d="M4 4h16v16H4z"></path><path d="M7 16V8l3 4 3-4v8"></path><path d="M17 8v8"></path><path d="M15 14l2 2 2-2"></path></svg></button>
+      <button class="icon-btn" type="button" title="导出 PDF" aria-label="导出 PDF" data-action="exportPdf"><svg viewBox="0 0 24 24"><path d="M6 3h9l3 3v15H6z"></path><path d="M14 3v4h4"></path><path d="M8 16h8"></path><path d="M8 12h8"></path></svg></button>
+      <button class="icon-btn" type="button" title="下载管理" aria-label="下载管理" data-action="toggleDownloadManager"><svg viewBox="0 0 24 24"><path d="M12 3v10"></path><path d="M8 9l4 4 4-4"></path><path d="M4 17h16"></path><path d="M6 21h12"></path></svg></button>
+      <button class="icon-btn" type="button" title="清理内存" aria-label="清理内存" data-action="optimizeMemory"><svg viewBox="0 0 24 24"><path d="M3 17h18"></path><path d="M5 17l2-10h10l2 10"></path><path d="M8 21h8"></path><path d="M9 7V3h6v4"></path></svg></button>
+    </div>
+  </header>
+  <div class="toast-region" aria-live="polite" aria-atomic="true"></div>
+  <section class="download-overlay" data-download-overlay data-open="false" aria-hidden="true">
+    <section class="download-panel" data-download-panel role="dialog" aria-modal="true" aria-label="下载管理">
+      <div class="download-head">
+        <div class="download-head-main">
+          <div class="download-title">下载管理</div>
+          <div class="download-summary" data-download-summary>暂无下载记录</div>
+        </div>
+        <input class="download-search" type="search" data-download-filter placeholder="搜索文件名、路径、地址或状态" />
+        <div class="download-head-actions">
+          <button class="text-btn" type="button" data-action="openDownloadSettings">下载设置</button>
+          <button class="text-btn" type="button" data-action="clearCompletedDownloads">清空已完成</button>
+          <button class="text-btn" type="button" data-action="newDownload">新建下载</button>
+          <button class="text-btn" type="button" data-action="closeDownloadManager">关闭</button>
+        </div>
+      </div>
+      <div class="download-body" data-download-list>
+        <div class="download-empty">暂无下载记录</div>
+      </div>
+      <div class="download-foot">
+        <div class="download-summary" data-download-footer-summary>按文件名或路径筛选下载项</div>
+        <div class="download-head-actions">
+          <button class="text-btn" type="button" data-action="closeDownloadManager">关闭</button>
+        </div>
+      </div>
+    </section>
+  </section>
+  <script>
+    const started = new Set(['__ACTIVE_SITE__']);
+    let activeSite = '__ACTIVE_SITE__';
+    let requestSeq = 0;
+    const downloadOverlay = document.querySelector('[data-download-overlay]');
+    const downloadPanel = document.querySelector('[data-download-panel]');
+    const downloadSearch = document.querySelector('[data-download-filter]');
+    const downloadSummary = document.querySelector('[data-download-summary]');
+    const downloadFooterSummary = document.querySelector('[data-download-footer-summary]');
+    let downloads = [];
+    let downloadPanelOpen = false;
+    let downloadFilter = '';
+    function sendCommand(type, payload = {}) {
+      if (!window.ipc || typeof window.ipc.postMessage !== 'function') return;
+      window.ipc.postMessage(JSON.stringify({ id: String(++requestSeq), type, payload }));
+    }
+    function formatBytes(bytes) {
+      if (!Number.isFinite(bytes) || bytes < 0) return '';
+      if (bytes < 1024) return `${bytes} B`;
+      const units = ['KB', 'MB', 'GB', 'TB'];
+      let value = bytes / 1024;
+      let unit = units[0];
+      for (let index = 1; index < units.length && value >= 1024; index += 1) {
+        value /= 1024;
+        unit = units[index];
+      }
+      return `${value.toFixed(value >= 10 ? 0 : 1)} ${unit}`;
+    }
+    function formatTimestamp(timestamp) {
+      const value = Number(timestamp);
+      if (!Number.isFinite(value) || value <= 0) return '';
+      return new Date(value).toLocaleString('zh-CN', { hour12: false });
+    }
+    function downloadStatusLabel(status) {
+      switch (status) {
+        case 'completed': return '已完成';
+        case 'failed': return '失败';
+        case 'started': return '下载中';
+        case 'diagnostic': return '诊断';
+        case 'cancelled': return '已取消';
+        case 'missing': return '缺失';
+        default: return status || '-';
+      }
+    }
+    function matchesDownloadFilter(item) {
+      const filter = downloadFilter.trim().toLowerCase();
+      if (!filter) return true;
+      const haystack = [
+        item.filename,
+        item.path,
+        item.url,
+        item.message,
+        item.status,
+        item.bytes != null ? String(item.bytes) : '',
+      ].join('\n').toLowerCase();
+      return haystack.includes(filter);
+    }
+    function updateDownloadSummary(visibleCount = downloads.length) {
+      const total = downloads.length;
+      const summary = total
+        ? (downloadFilter.trim()
+          ? `已显示 ${visibleCount} / ${total} 项`
+          : `共 ${total} 项`)
+        : '暂无下载记录';
+      if (downloadSummary) downloadSummary.textContent = summary;
+      if (downloadFooterSummary) {
+        downloadFooterSummary.textContent = total
+          ? (downloadFilter.trim() ? `筛选后 ${visibleCount} / ${total} 项` : `共 ${total} 项`)
+          : '暂无下载记录';
+      }
+    }
+    function setActive(site) {
+      activeSite = site;
+      started.add(site);
+      document.querySelectorAll('.tab').forEach(tab => {
+        const active = tab.dataset.site === site;
+        tab.dataset.active = String(active);
+        tab.dataset.started = String(started.has(tab.dataset.site));
+      });
+    }
+    function closeSite(site) {
+      if (site === 'chatgpt') return;
+      started.delete(site);
+      if (activeSite === site) activeSite = 'chatgpt';
+      setActive(activeSite);
+      sendCommand('closeSite', { site });
+    }
+    function optimizeMemory() {
+      const keep = new Set(['chatgpt', activeSite]);
+      [...started].forEach(site => {
+        if (!keep.has(site)) started.delete(site);
+      });
+      setActive(activeSite);
+      sendCommand('optimizeMemory');
+    }
+    function measureActiveLatency() {
+      const label = document.querySelector('[data-latency-label]');
+      if (label) {
+        label.textContent = '延时 ...';
+        label.dataset.health = 'unknown';
+      }
+      sendCommand('measureLatency', { site: activeSite });
+    }
+    function setDownloadPanelOpen(open) {
+      downloadPanelOpen = Boolean(open);
+      if (downloadOverlay) {
+        downloadOverlay.dataset.open = String(downloadPanelOpen);
+        downloadOverlay.setAttribute('aria-hidden', String(!downloadPanelOpen));
+      }
+      if (downloadPanelOpen) {
+        sendCommand('setDownloadManagerOpen', { open: true });
+        renderDownloads();
+        window.setTimeout(() => {
+          downloadSearch?.focus();
+          downloadSearch?.select();
+        }, 0);
+      } else {
+        sendCommand('setDownloadManagerOpen', { open: false });
+        updateDownloadSummary();
+      }
+    }
+    function toggleDownloadPanel() {
+      setDownloadPanelOpen(!downloadPanelOpen);
+    }
+    function clearCompletedDownloads() {
+      downloads = downloads.filter(item => item.status !== 'completed');
+      renderDownloads();
+      sendCommand('clearCompletedDownloads');
+    }
+    function renderDownloads() {
+      const list = document.querySelector('[data-download-list]');
+      if (!list) return;
+      if (!downloadPanelOpen) {
+        updateDownloadSummary();
+        return;
+      }
+
+      const filtered = downloads.filter(matchesDownloadFilter);
+      updateDownloadSummary(filtered.length);
+      list.replaceChildren();
+
+      if (!downloads.length) {
+        const empty = document.createElement('div');
+        empty.className = 'download-empty';
+        empty.textContent = '暂无下载记录';
+        list.appendChild(empty);
+        return;
+      }
+
+      if (!filtered.length) {
+        const empty = document.createElement('div');
+        empty.className = 'download-empty';
+        empty.textContent = '没有匹配的下载记录';
+        list.appendChild(empty);
+        return;
+      }
+
+      filtered.forEach(item => {
+        const row = document.createElement('div');
+        row.className = 'download-item';
+        const icon = document.createElement('div');
+        icon.className = 'download-row-icon';
+        icon.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h9l3 3v15H6z"></path><path d="M14 3v4h4"></path><path d="M8 15h8"></path><path d="M8 11h8"></path></svg>';
+        const main = document.createElement('div');
+        main.className = 'download-main';
+        const nameRow = document.createElement('div');
+        nameRow.className = 'download-name-row';
+        const name = document.createElement('div');
+        name.className = 'download-name';
+        name.textContent = item.filename || 'download';
+        const status = document.createElement('span');
+        status.className = 'download-status';
+        status.dataset.status = item.status || 'missing';
+        status.textContent = downloadStatusLabel(item.status);
+        nameRow.append(name, status);
+        const meta = document.createElement('div');
+        meta.className = 'download-meta';
+        const details = [formatBytes(item.bytes), formatTimestamp(item.timestamp_ms)].filter(Boolean);
+        meta.textContent = details.length ? details.join(' · ') : (item.message || item.status || '-');
+        const path = document.createElement('div');
+        path.className = 'download-path';
+        path.title = item.path || item.url || '';
+        path.textContent = item.path || item.url || item.message || '';
+        main.append(nameRow, meta, path);
+        const actions = document.createElement('div');
+        actions.className = 'download-actions';
+        if (item.path) {
+          const open = document.createElement('button');
+          open.className = 'download-icon-action';
+          open.type = 'button';
+          open.title = '打开';
+          open.setAttribute('aria-label', '打开');
+          open.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h9l3 3v15H6z"></path><path d="M14 3v4h4"></path></svg>';
+          open.addEventListener('click', () => sendCommand('openDownloadPath', { path: item.path }));
+          const folder = document.createElement('button');
+          folder.className = 'download-icon-action';
+          folder.type = 'button';
+          folder.title = '打开所在文件夹';
+          folder.setAttribute('aria-label', '打开所在文件夹');
+          folder.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h7l2 2h9v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path></svg>';
+          folder.addEventListener('click', () => sendCommand('openDownloadFolder', { path: item.path }));
+          actions.append(open, folder);
+        }
+        const remove = document.createElement('button');
+        remove.className = 'download-icon-action';
+        remove.type = 'button';
+        remove.title = '删除记录';
+        remove.setAttribute('aria-label', '删除记录');
+        remove.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6L6 18"></path><path d="M6 6l12 12"></path></svg>';
+        remove.addEventListener('click', () => {
+          downloads = downloads.filter(record => record.id !== item.id);
+          renderDownloads();
+          sendCommand('deleteDownloadRecord', { id: item.id });
+        });
+        actions.append(remove);
+        row.append(icon, main, actions);
+        list.appendChild(row);
+      });
+    }
+    window.__aiClientSyncTabs = (active, loaded) => {
+      started.clear();
+      (Array.isArray(loaded) ? loaded : ['chatgpt']).forEach(site => started.add(site));
+      started.add('chatgpt');
+      activeSite = active || 'chatgpt';
+      setActive(activeSite);
+      measureActiveLatency();
+    };
+    window.__aiClientSyncDownloads = (payload = {}) => {
+      downloads = Array.isArray(payload.downloads) ? payload.downloads : [];
+      if (downloadPanelOpen) {
+        renderDownloads();
+      } else {
+        updateDownloadSummary();
+      }
+    };
+    window.__aiClientUpdateLatency = ({ site, delay_ms, success } = {}) => {
+      if (site && site !== activeSite) return;
+      const label = document.querySelector('[data-latency-label]');
+      if (!label) return;
+      if (success && Number.isFinite(delay_ms)) {
+        label.textContent = `延时 ${delay_ms}ms`;
+        label.dataset.health = delay_ms < 3000 ? 'good' : 'bad';
+      } else {
+        label.textContent = '延时失败';
+        label.dataset.health = 'bad';
+      }
+    };
+    window.__aiClientNotifyDownload = ({ status, path, success } = {}) => {
+      const region = document.querySelector('.toast-region');
+      if (!region) return;
+      const toast = document.createElement('div');
+      toast.className = 'toast';
+      toast.dataset.success = String(success !== false);
+      const title = document.createElement('div');
+      title.className = 'toast-title';
+      title.textContent = status || '下载状态';
+      toast.appendChild(title);
+      if (path) {
+        const detail = document.createElement('button');
+        detail.type = 'button';
+        detail.className = 'toast-path';
+        detail.dataset.action = 'openDownloadPath';
+        detail.dataset.path = path;
+        detail.title = path;
+        detail.textContent = path;
+        detail.addEventListener('click', () => sendCommand('openDownloadPath', { path }));
+        toast.appendChild(detail);
+      }
+      region.appendChild(toast);
+      while (region.children.length > 3) region.firstElementChild.remove();
+      setTimeout(() => toast.remove(), 5200);
+    };
+    document.querySelectorAll('.tab').forEach(tab => {
+      tab.addEventListener('click', event => {
+        if (event.target.closest('.tab-close')) return;
+        const site = tab.dataset.site;
+        setActive(site);
+        sendCommand('switchSite', { site });
+        measureActiveLatency();
+      });
+      tab.addEventListener('keydown', event => {
+        if (!['Enter', ' '].includes(event.key)) return;
+        event.preventDefault();
+        const site = tab.dataset.site;
+        setActive(site);
+        sendCommand('switchSite', { site });
+        measureActiveLatency();
+      });
+    });
+    document.querySelectorAll('.tab-close').forEach(button => {
+      button.addEventListener('click', event => {
+        event.stopPropagation();
+        closeSite(button.dataset.site);
+      });
+    });
+    document.querySelectorAll('.actions [data-action]').forEach(button => {
+      button.addEventListener('click', () => {
+        if (button.dataset.action === 'optimizeMemory') optimizeMemory();
+        else if (button.dataset.action === 'toggleDownloadManager') toggleDownloadPanel();
+        else if (button.dataset.action === 'exportMarkdown') sendCommand('exportConversation', { format: 'markdown' });
+        else if (button.dataset.action === 'exportPdf') sendCommand('exportConversation', { format: 'pdf' });
+        else sendCommand(button.dataset.action);
+      });
+    });
+    downloadOverlay?.addEventListener('click', event => {
+      if (event.target === downloadOverlay) setDownloadPanelOpen(false);
+    });
+    downloadOverlay?.addEventListener('transitionend', () => {
+      if (!downloadPanelOpen) sendCommand('setDownloadManagerOpen', { open: false });
+    });
+    downloadPanel?.addEventListener('click', event => {
+      const button = event.target.closest('[data-action]');
+      if (!button) return;
+      if (button.dataset.action === 'toggleDownloadManager' || button.dataset.action === 'closeDownloadManager') setDownloadPanelOpen(false);
+      else if (button.dataset.action === 'clearCompletedDownloads') clearCompletedDownloads();
+      else if (button.dataset.action === 'openDownloadSettings' || button.dataset.action === 'newDownload') {
+        setDownloadPanelOpen(false);
+        sendCommand('openDownloadSettings');
+      }
+    });
+    downloadSearch?.addEventListener('input', () => {
+      downloadFilter = downloadSearch.value || '';
+      renderDownloads();
+    });
+    downloadSearch?.addEventListener('keydown', event => {
+      if (event.key === 'Escape') setDownloadPanelOpen(false);
+    });
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && downloadPanelOpen) {
+        setDownloadPanelOpen(false);
+        return;
+      }
+      if (event.altKey && ['1', '2', '3', '4'].includes(event.key)) {
+        const site = ['chatgpt', 'gemini', 'notebooklm', 'aistudio'][Number(event.key) - 1];
+        setActive(site);
+        sendCommand('switchSite', { site });
+        measureActiveLatency();
+      }
+    });
+    setTimeout(measureActiveLatency, 5000);
+    setInterval(measureActiveLatency, 60000);
   </script>
 </body>
 </html>"#;
@@ -1132,8 +2784,519 @@ fn top_shell_url() -> &'static str {
 fn top_shell_response(active_site: AiSite) -> Response<Cow<'static, [u8]>> {
     Response::builder()
         .header(CONTENT_TYPE, "text/html; charset=utf-8")
+        .header(CACHE_CONTROL, "no-store, no-cache, max-age=0")
+        .header(PRAGMA, "no-cache")
+        .header(EXPIRES, "0")
         .body(Cow::Owned(top_shell_html(active_site).into_bytes()))
         .expect("top shell response headers are valid")
+}
+
+fn download_interceptor_script() -> &'static str {
+    r#"
+(() => {
+  if (window.__chatgptClientDownloadInterceptorInstalled) return;
+  window.__chatgptClientDownloadInterceptorInstalled = true;
+
+  const pending = new Map();
+  let requestSeq = 0;
+  const previousReceive = window.__chatgptClientReceive;
+  window.__chatgptClientReceive = (message) => {
+    const entry = message && pending.get(message.id);
+    if (entry) {
+      pending.delete(message.id);
+      if (message.ok) entry.resolve(message.data);
+      else entry.reject(new Error(message.error || '下载失败'));
+      return;
+    }
+    if (typeof previousReceive === 'function') previousReceive(message);
+  };
+
+  function canUseNativeIpc() {
+    return window.ipc && typeof window.ipc.postMessage === 'function';
+  }
+
+  function sendSaveDownload(payload) {
+    if (!canUseNativeIpc()) return Promise.reject(new Error('当前页面暂不能保存文件'));
+    const id = `download-${++requestSeq}`;
+    return new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+      window.ipc.postMessage(JSON.stringify({ id, type: 'saveDownload', payload }));
+      setTimeout(() => {
+        if (pending.delete(id)) reject(new Error('保存文件超时'));
+      }, 30000);
+    });
+  }
+
+  function notifyDownloadError(message) {
+    if (!canUseNativeIpc()) return;
+    window.ipc.postMessage(JSON.stringify({
+      id: `download-error-${++requestSeq}`,
+      type: 'downloadDiagnostic',
+      payload: { level: 'error', message: String(message || '下载失败') }
+    }));
+  }
+
+  function filenameFromAnchor(anchor, url) {
+    const explicitName = anchor && anchor.getAttribute('download');
+    if (explicitName && explicitName.trim()) return explicitName.trim();
+    try {
+      const parsed = new URL(url, window.location.href);
+      const last = parsed.pathname.split('/').filter(Boolean).pop();
+      return decodeURIComponent(last || 'download');
+    } catch (_) {
+      return 'download';
+    }
+  }
+
+  function blobToBase64(blob) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const value = String(reader.result || '');
+        resolve(value.includes(',') ? value.split(',').pop() : value);
+      };
+      reader.onerror = () => reject(reader.error || new Error('读取下载内容失败'));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  async function saveBlobUrl(url, filename) {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`读取下载内容失败：${response.status}`);
+    const blob = await response.blob();
+    const contentBase64 = await blobToBase64(blob);
+    return sendSaveDownload({ filename, content_base64: contentBase64 });
+  }
+
+  function saveDataUrl(url, filename) {
+    const comma = url.indexOf(',');
+    if (comma < 0) return Promise.reject(new Error('无效的 data 下载链接'));
+    const meta = url.slice(0, comma);
+    const body = url.slice(comma + 1);
+    const contentBase64 = /;base64/i.test(meta)
+      ? body
+      : btoa(unescape(encodeURIComponent(decodeURIComponent(body))));
+    return sendSaveDownload({ filename, content_base64: contentBase64 });
+  }
+
+  async function saveClientSideDownload(url, filename) {
+    if (url.startsWith('blob:')) return saveBlobUrl(url, filename);
+    if (url.startsWith('data:')) return saveDataUrl(url, filename);
+    return null;
+  }
+
+  function handleDownloadAnchor(anchor) {
+    if (!anchor) return false;
+    const href = anchor.href || '';
+    if (!href.startsWith('blob:') && !href.startsWith('data:')) return false;
+    const filename = filenameFromAnchor(anchor, href);
+    saveClientSideDownload(href, filename).catch(error => {
+      console.warn('[AI Web Client] download fallback failed', error);
+    });
+    return true;
+  }
+
+  document.addEventListener('click', (event) => {
+    const anchor = event.target && event.target.closest && event.target.closest('a[href]');
+    if (!handleDownloadAnchor(anchor)) return;
+    event.preventDefault();
+    event.stopPropagation();
+  }, true);
+
+  const nativeAnchorClick = HTMLAnchorElement.prototype.click;
+  HTMLAnchorElement.prototype.click = function() {
+    if (handleDownloadAnchor(this)) return;
+    return nativeAnchorClick.apply(this, arguments);
+  };
+
+  const nativeOpen = window.open;
+  window.open = function(url, target, features) {
+    if (typeof url === 'string' && (url.startsWith('blob:') || url.startsWith('data:'))) {
+      saveClientSideDownload(url, filenameFromAnchor(null, url)).catch(error => {
+        console.warn('[AI Web Client] popup download fallback failed', error);
+      });
+      return null;
+    }
+    return nativeOpen ? nativeOpen.apply(window, arguments) : null;
+  };
+
+  window.__aiClientNativeShowSaveFilePicker = window.showSaveFilePicker;
+  window.showSaveFilePicker = async function(options = {}) {
+    const suggestedName = options.suggestedName || 'download';
+    let chunks = [];
+    let closed = false;
+    async function flush() {
+      if (closed) return;
+      closed = true;
+      const blob = new Blob(chunks);
+      const contentBase64 = await blobToBase64(blob);
+      chunks = [];
+      return sendSaveDownload({ filename: suggestedName, content_base64: contentBase64 });
+    }
+    return {
+      kind: 'file',
+      name: suggestedName,
+      async createWritable() {
+        return {
+          async write(chunk) {
+            if (chunk == null) return;
+            if (chunk instanceof Blob) chunks.push(chunk);
+            else if (chunk instanceof ArrayBuffer) chunks.push(new Blob([chunk]));
+            else if (ArrayBuffer.isView(chunk)) chunks.push(new Blob([chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength)]));
+            else if (typeof chunk === 'object' && chunk.type === 'write' && chunk.data != null) {
+              const data = chunk.data;
+              if (data instanceof Blob) chunks.push(data);
+              else if (data instanceof ArrayBuffer) chunks.push(new Blob([data]));
+              else if (ArrayBuffer.isView(data)) chunks.push(new Blob([data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)]));
+              else chunks.push(new Blob([String(data)]));
+            } else if (typeof chunk === 'object' && (chunk.type === 'seek' || chunk.type === 'truncate')) {
+              return;
+            } else {
+              chunks.push(new Blob([String(chunk)]));
+            }
+          },
+          async close() { return flush(); },
+          async abort() { chunks = []; closed = true; }
+        };
+      }
+    };
+  };
+
+  navigator.msSaveBlob = navigator.msSaveBlob || function(blob, filename) {
+    saveClientSideDownload(URL.createObjectURL(blob), filename || 'download').catch(error => {
+      notifyDownloadError(error && (error.message || error));
+    });
+    return true;
+  };
+  navigator.msSaveOrOpenBlob = navigator.msSaveOrOpenBlob || navigator.msSaveBlob;
+
+  window.addEventListener('unhandledrejection', event => {
+    const message = event.reason && (event.reason.message || event.reason);
+    if (String(message || '').includes('下载') || String(message || '').includes('save')) {
+      notifyDownloadError(message);
+    }
+  });
+})();
+"#
+}
+
+fn export_conversation_script(site: AiSite, format: ExportFormat) -> String {
+    let site_title = site.title();
+    let format_key = format.key();
+    format!(
+        r#"
+(() => {{
+  const format = '{format_key}';
+  const siteTitle = {site_title:?};
+  let requestSeq = window.__aiClientExportSeq || 0;
+  window.__aiClientExportSeq = requestSeq + 1;
+
+  function textOf(element) {{
+    return (element && element.innerText ? element.innerText : '')
+      .replace(/\r/g, '')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{{3,}}/g, '\n\n')
+      .trim();
+  }}
+
+  function roleLabel(role, index) {{
+    const normalized = String(role || '').toLowerCase();
+    if (normalized.includes('user') || normalized.includes('human')) return '用户';
+    if (normalized.includes('assistant') || normalized.includes('model') || normalized.includes('ai')) return 'AI';
+    return index % 2 === 0 ? '用户' : 'AI';
+  }}
+
+  function uniqueBlocks(selectors) {{
+    const seen = new Set();
+    const blocks = [];
+    selectors.forEach(selector => {{
+      document.querySelectorAll(selector).forEach(element => {{
+        if (seen.has(element)) return;
+        seen.add(element);
+        const text = textOf(element);
+        if (text.length < 2) return;
+        const role = element.getAttribute('data-message-author-role')
+          || element.getAttribute('data-testid')
+          || element.getAttribute('aria-label')
+          || element.className
+          || '';
+        blocks.push({{ role, text }});
+      }});
+    }});
+    return blocks;
+  }}
+
+  function extractConversationMarkdown() {{
+    const selectors = [
+      '[data-message-author-role]',
+      '[data-testid*="conversation-turn"]',
+      '[data-testid*="message"]',
+      'message-content',
+      'article',
+      'main [role="listitem"]',
+      'main .conversation-container',
+      'main .markdown',
+      'main p'
+    ];
+    let blocks = uniqueBlocks(selectors);
+    if (blocks.length < 2) {{
+      const main = document.querySelector('main') || document.body;
+      const fallback = textOf(main);
+      if (fallback.length > 20) blocks = [{{ role: '页面', text: fallback }}];
+    }}
+    const compact = [];
+    blocks.forEach((block, index) => {{
+      const text = block.text;
+      if (!text || compact.some(existing => existing.text === text || existing.text.includes(text))) return;
+      compact.push({{ role: roleLabel(block.role, index), text }});
+    }});
+    if (!compact.length) throw new Error('当前页面未识别到可导出的对话内容');
+    return compact.map((block, index) => `## ${{index + 1}}. ${{block.role}}\n\n${{block.text}}`).join('\n\n');
+  }}
+
+  try {{
+    const markdown = extractConversationMarkdown();
+    window.ipc.postMessage(JSON.stringify({{
+      id: `export-${{++requestSeq}}`,
+      type: 'exportConversation',
+      payload: {{
+        format,
+        site_title: siteTitle,
+        url: location.href,
+        title: document.title || siteTitle,
+        markdown
+      }}
+    }}));
+  }} catch (error) {{
+    window.ipc.postMessage(JSON.stringify({{
+      id: `export-error-${{++requestSeq}}`,
+      type: 'downloadDiagnostic',
+      payload: {{ level: 'error', message: `导出失败：${{error && (error.message || error)}}` }}
+    }}));
+  }}
+}})();
+"#
+    )
+}
+
+fn rendered_pdf_filename(site: AiSite) -> String {
+    format!(
+        "{}-page-export.pdf",
+        sanitize_download_filename(site.title())
+    )
+}
+
+#[cfg(windows)]
+fn export_current_page_pdf(webview: &WebView, site: AiSite) -> Result<DownloadEvent> {
+    let filename = rendered_pdf_filename(site);
+    let path = download_destination_for(Path::new(&filename));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("could not create export directory {}", parent.display()))?;
+    }
+
+    print_webview_to_pdf(webview, &path)?;
+    let bytes = std::fs::metadata(&path).ok().map(|metadata| metadata.len());
+
+    Ok(DownloadEvent {
+        kind: DownloadEventKind::Completed,
+        status: "PDF 导出完成".to_string(),
+        path: Some(path),
+        url: Some(site.url().to_string()),
+        bytes,
+        success: true,
+    })
+}
+
+#[cfg(not(windows))]
+fn export_current_page_pdf(_webview: &WebView, site: AiSite) -> Result<DownloadEvent> {
+    let bytes = export_pdf_document(site.title(), site.url());
+    let path = write_download_bytes(&rendered_pdf_filename(site), &bytes)?;
+
+    Ok(DownloadEvent {
+        kind: DownloadEventKind::Completed,
+        status: "PDF 导出完成".to_string(),
+        path: Some(path),
+        url: Some(site.url().to_string()),
+        bytes: Some(bytes.len() as u64),
+        success: true,
+    })
+}
+
+#[cfg(windows)]
+fn print_webview_to_pdf(webview: &WebView, path: &Path) -> Result<()> {
+    let environment: ICoreWebView2Environment6 = webview
+        .environment()
+        .cast()
+        .context("WebView2 runtime does not support PDF print settings")?;
+    let core: ICoreWebView2_7 = webview
+        .webview()
+        .cast()
+        .context("WebView2 runtime does not support PrintToPdf")?;
+    let settings = unsafe { environment.CreatePrintSettings() }
+        .context("could not create WebView2 print settings")?;
+    unsafe {
+        settings
+            .SetOrientation(COREWEBVIEW2_PRINT_ORIENTATION_PORTRAIT)
+            .context("could not set PDF orientation")?;
+        settings
+            .SetShouldPrintBackgrounds(true)
+            .context("could not enable PDF backgrounds")?;
+        settings
+            .SetShouldPrintHeaderAndFooter(false)
+            .context("could not disable PDF headers")?;
+        settings
+            .SetScaleFactor(1.0)
+            .context("could not set PDF scale")?;
+    }
+
+    let path_string = path.display().to_string();
+    let path_wide = CoTaskMemPWSTR::from(path_string.as_str());
+    PrintToPdfCompletedHandler::wait_for_async_operation(
+        Box::new(move |handler| unsafe {
+            core.PrintToPdf(*path_wide.as_ref().as_pcwstr(), &settings, &handler)
+                .map_err(webview2_com::Error::WindowsError)
+        }),
+        Box::new(|error_code, success| {
+            error_code?;
+            if success {
+                Ok(())
+            } else {
+                Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+                    0x8000_4005u32 as i32,
+                )))
+            }
+        }),
+    )
+    .map_err(|error| anyhow::anyhow!("WebView2 PrintToPdf failed: {error}"))
+}
+
+fn parse_latency_event(body: &str) -> Option<LatencyEvent> {
+    let message = serde_json::from_str::<Value>(body).ok()?;
+    if ipc_command(&message) != "latencyResult" {
+        return None;
+    }
+    let payload = message.get("payload")?;
+    let site = payload
+        .get("site")
+        .and_then(Value::as_str)
+        .and_then(AiSite::from_key)?;
+    let delay_ms = payload.get("delay_ms").and_then(Value::as_u64);
+    let success = payload
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(delay_ms.is_some());
+    let error = payload
+        .get("error")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    Some(LatencyEvent {
+        site,
+        delay_ms,
+        success,
+        error,
+    })
+}
+
+fn latency_notification_script(event: &LatencyEvent) -> String {
+    let payload = json!({
+        "site": event.site.key(),
+        "delay_ms": event.delay_ms,
+        "success": event.success,
+        "error": event.error,
+    });
+    format!("window.__aiClientUpdateLatency && window.__aiClientUpdateLatency({payload});")
+}
+
+fn measure_site_latency(site: AiSite, app_state: &Arc<Mutex<AppRuntimeState>>) -> LatencyEvent {
+    let proxy = latency_proxy_snapshot(app_state);
+    match measure_site_latency_with_proxy(site, proxy.as_ref()) {
+        Ok(delay_ms) => LatencyEvent {
+            site,
+            delay_ms: Some(delay_ms),
+            success: true,
+            error: None,
+        },
+        Err(error) => LatencyEvent {
+            site,
+            delay_ms: None,
+            success: false,
+            error: Some(format!("{error:#}")),
+        },
+    }
+}
+
+fn measure_site_latency_with_proxy(site: AiSite, proxy: Option<&ProxySettings>) -> Result<u64> {
+    let client = latency_http_client(proxy)?;
+    let started = Instant::now();
+    client
+        .get(latency_url_for_site(site))
+        .header("cache-control", "no-cache")
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .with_context(|| format!("could not reach {}", site.title()))?;
+
+    Ok(started.elapsed().as_millis().try_into().unwrap_or(u64::MAX))
+}
+
+fn latency_http_client(proxy: Option<&ProxySettings>) -> Result<Client> {
+    let timeout = Duration::from_millis(DELAY_TIMEOUT_MS);
+    let mut builder = Client::builder()
+        .timeout(timeout)
+        .connect_timeout(timeout)
+        .user_agent("EasyGPT/0.1 latency-check");
+
+    if let Some(proxy_settings) = proxy {
+        builder = builder.proxy(reqwest::Proxy::all(proxy_url(proxy_settings)?)?);
+    }
+
+    builder
+        .build()
+        .context("could not build latency check HTTP client")
+}
+
+fn latency_proxy_snapshot(app_state: &Arc<Mutex<AppRuntimeState>>) -> Option<ProxySettings> {
+    let Ok(state) = app_state.lock() else {
+        return None;
+    };
+
+    match state.settings.proxy.mode {
+        ProxyMode::Direct => None,
+        ProxyMode::System => startup_proxy(&state.settings),
+        ProxyMode::InternalClash => state
+            .clash_runtime
+            .as_ref()
+            .map(ClashRuntime::proxy_settings)
+            .or_else(|| startup_proxy(&state.settings)),
+    }
+}
+
+fn latency_url_for_site(site: AiSite) -> &'static str {
+    match site {
+        AiSite::ChatGpt => DELAY_TEST_URL,
+        _ => site.url(),
+    }
+}
+
+fn proxy_url(proxy_settings: &ProxySettings) -> Result<String> {
+    let scheme = match proxy_settings.scheme {
+        ProxyScheme::Http => "http",
+        ProxyScheme::Socks5 => "socks5h",
+    };
+    if proxy_settings.host.trim().is_empty() || proxy_settings.port.trim().is_empty() {
+        anyhow::bail!("proxy host or port is empty");
+    }
+
+    Ok(format!(
+        "{scheme}://{}:{}",
+        proxy_settings.host.trim(),
+        proxy_settings.port.trim()
+    ))
+}
+
+fn should_spawn_initial_runtime_start(mode: ProxyMode, already_spawned: bool) -> bool {
+    matches!(mode, ProxyMode::InternalClash) && !already_spawned
 }
 
 fn spawn_runtime_watchdog(app_state: Arc<Mutex<AppRuntimeState>>) {
@@ -1155,13 +3318,31 @@ fn spawn_initial_runtime_start(
     event_proxy: tao::event_loop::EventLoopProxy<UserEvent>,
 ) {
     thread::spawn(move || {
+        let started = Instant::now();
+        let send_progress = |stage: StartupStage, message: Option<String>| {
+            let _ = event_proxy.send_event(UserEvent::StartupProgress(StartupProgress {
+                stage,
+                elapsed_secs: started.elapsed().as_secs(),
+                message,
+            }));
+        };
+        send_progress(StartupStage::LoadSubscription, None);
         let Ok(mut state) = app_state.lock() else {
             return;
         };
-        if matches!(state.settings.proxy.mode, ProxyMode::InternalClash)
-            && state.restart_clash_runtime()
-        {
-            let _ = event_proxy.send_event(UserEvent::RuntimeReady);
+        if matches!(state.settings.proxy.mode, ProxyMode::InternalClash) {
+            send_progress(StartupStage::StartMihomo, None);
+            if state.restart_clash_runtime() {
+                send_progress(StartupStage::Ready, None);
+                let _ = event_proxy.send_event(UserEvent::RuntimeReady);
+            } else {
+                let message = state
+                    .runtime_error
+                    .clone()
+                    .unwrap_or_else(|| "internal Clash runtime failed to start".to_string());
+                send_progress(StartupStage::Failed, Some(message.clone()));
+                let _ = event_proxy.send_event(UserEvent::RuntimeFailed(message));
+            }
         }
     });
 }
@@ -1272,6 +3453,459 @@ fn handle_ipc_message_concurrent(body: &str, app_state: &Arc<Mutex<AppRuntimeSta
     };
 
     ipc_result(id.as_deref(), result)
+}
+
+fn is_save_download_request(body: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .is_some_and(|message| ipc_command(&message) == "saveDownload")
+}
+
+fn is_export_conversation_request(body: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .is_some_and(|message| ipc_command(&message) == "exportConversation")
+}
+
+fn parse_download_diagnostic_event(body: &str) -> Option<DownloadEvent> {
+    let message = serde_json::from_str::<Value>(body).ok()?;
+    if ipc_command(&message) != "downloadDiagnostic" {
+        return None;
+    }
+
+    let payload = message.get("payload")?;
+    let level = payload
+        .get("level")
+        .and_then(Value::as_str)
+        .unwrap_or("info");
+    let message = payload
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("下载诊断事件");
+
+    Some(DownloadEvent {
+        kind: DownloadEventKind::Diagnostic,
+        status: format!("下载诊断：{message}"),
+        path: None,
+        url: None,
+        bytes: None,
+        success: level != "error",
+    })
+}
+
+fn handle_export_conversation_message_with_event(body: &str) -> (String, DownloadEvent) {
+    let message = match serde_json::from_str::<Value>(body) {
+        Ok(message) => message,
+        Err(error) => {
+            return (
+                ipc_error(None, format!("ignored invalid export IPC: {error}")),
+                DownloadEvent {
+                    kind: DownloadEventKind::Failed,
+                    status: "导出失败".to_string(),
+                    path: None,
+                    url: None,
+                    bytes: None,
+                    success: false,
+                },
+            );
+        }
+    };
+    let id = ipc_message_id(&message);
+    match export_conversation_payload(&message) {
+        Ok(payload) => {
+            let path = payload
+                .get("path")
+                .and_then(Value::as_str)
+                .map(PathBuf::from);
+            let bytes = payload.get("bytes").and_then(Value::as_u64);
+            (
+                ipc_ok(id.as_deref(), payload),
+                DownloadEvent {
+                    kind: DownloadEventKind::Completed,
+                    status: "导出完成".to_string(),
+                    path,
+                    url: None,
+                    bytes,
+                    success: true,
+                },
+            )
+        }
+        Err(error) => (
+            ipc_error(id.as_deref(), format!("{error:#}")),
+            DownloadEvent {
+                kind: DownloadEventKind::Failed,
+                status: format!("导出失败：{error:#}"),
+                path: None,
+                url: None,
+                bytes: None,
+                success: false,
+            },
+        ),
+    }
+}
+
+fn export_conversation_payload(message: &Value) -> Result<Value> {
+    let payload = message
+        .get("payload")
+        .context("exportConversation payload is missing")?;
+    let format = payload
+        .get("format")
+        .and_then(Value::as_str)
+        .and_then(ExportFormat::from_key)
+        .context("export format is missing or invalid")?;
+    let site_title = payload
+        .get("site_title")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("AI Conversation");
+    let url = payload.get("url").and_then(Value::as_str).unwrap_or("");
+    let markdown = payload
+        .get("markdown")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .context("当前页面未识别到可导出的对话内容")?;
+    let document = export_markdown_document(site_title, url, markdown);
+    let bytes = match format {
+        ExportFormat::Markdown => document.into_bytes(),
+        ExportFormat::Pdf => export_pdf_document(site_title, &document),
+    };
+    let filename = format!(
+        "{}-conversation.{}",
+        sanitize_download_filename(site_title),
+        format.extension()
+    );
+    let path = write_download_bytes(&filename, &bytes)?;
+
+    Ok(json!({
+        "path": path.display().to_string(),
+        "bytes": bytes.len(),
+        "format": format.key(),
+    }))
+}
+
+fn export_markdown_document(site_title: &str, url: &str, markdown: &str) -> String {
+    let mut output = String::new();
+    output.push_str("# ");
+    output.push_str(site_title.trim().if_empty("AI Conversation"));
+    output.push_str("\n\n");
+    if !url.trim().is_empty() {
+        output.push_str("来源：<");
+        output.push_str(url.trim());
+        output.push_str(">\n\n");
+    }
+    output.push_str("---\n\n");
+    output.push_str(markdown.trim());
+    output.push('\n');
+    output
+}
+
+trait IfEmpty {
+    fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str;
+}
+
+impl IfEmpty for str {
+    fn if_empty<'a>(&'a self, fallback: &'a str) -> &'a str {
+        if self.is_empty() { fallback } else { self }
+    }
+}
+
+fn export_pdf_document(title: &str, markdown: &str) -> Vec<u8> {
+    let lines = wrap_pdf_lines(markdown, 58);
+    let pages = lines
+        .chunks(48)
+        .map(|chunk| chunk.to_vec())
+        .collect::<Vec<_>>();
+    let pages = if pages.is_empty() {
+        vec![vec![String::from("(empty)")]]
+    } else {
+        pages
+    };
+
+    let mut objects = Vec::new();
+    objects.push(String::from("<< /Type /Catalog /Pages 2 0 R >>"));
+
+    let page_ids = (0..pages.len())
+        .map(|index| 3 + index * 2)
+        .collect::<Vec<_>>();
+    let kids = page_ids
+        .iter()
+        .map(|id| format!("{id} 0 R"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    objects.push(format!(
+        "<< /Type /Pages /Kids [{kids}] /Count {} >>",
+        page_ids.len()
+    ));
+
+    let font_id = 3 + pages.len() * 2;
+    let descendant_font_id = font_id + 1;
+    let cid_info_id = font_id + 2;
+
+    for (index, page_lines) in pages.iter().enumerate() {
+        let page_id = 3 + index * 2;
+        let content_id = page_id + 1;
+        objects.push(format!(
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 {font_id} 0 R >> >> /Contents {content_id} 0 R >>"
+        ));
+        let stream = pdf_page_stream(title, page_lines);
+        objects.push(format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            stream.len(),
+            stream
+        ));
+    }
+
+    objects.push(format!(
+        "<< /Type /Font /Subtype /Type0 /BaseFont /STSong-Light /Encoding /UniGB-UCS2-H /DescendantFonts [{descendant_font_id} 0 R] >>"
+    ));
+    objects.push(format!(
+        "<< /Type /Font /Subtype /CIDFontType0 /BaseFont /STSong-Light /CIDSystemInfo {cid_info_id} 0 R /DW 1000 /W [1 [500]] >>"
+    ));
+    objects.push(String::from(
+        "<< /Registry (Adobe) /Ordering (GB1) /Supplement 5 >>",
+    ));
+
+    let mut pdf = String::from("%PDF-1.4\n% EasyGPT\n");
+    let mut offsets = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        let object_id = index + 1;
+        let _ = write!(pdf, "{object_id} 0 obj\n{object}\nendobj\n");
+    }
+    let xref_offset = pdf.len();
+    let _ = write!(pdf, "xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1);
+    for offset in offsets {
+        let _ = writeln!(pdf, "{offset:010} 00000 n ");
+    }
+    let _ = write!(
+        pdf,
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+        objects.len() + 1,
+        xref_offset
+    );
+    pdf.into_bytes()
+}
+
+fn pdf_page_stream(title: &str, lines: &[String]) -> String {
+    let mut stream = String::from("BT\n/F1 10 Tf\n50 800 Td\n");
+    let heading = format!("{} - EasyGPT Export", title);
+    let _ = writeln!(stream, "<{}> Tj", pdf_utf16be_hex(&heading));
+    stream.push_str("0 -18 Td\n");
+    for line in lines {
+        let _ = writeln!(stream, "<{}> Tj", pdf_utf16be_hex(line));
+        stream.push_str("0 -14 Td\n");
+    }
+    stream.push_str("ET");
+    stream
+}
+
+fn wrap_pdf_lines(text: &str, max_chars: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for raw_line in text.lines() {
+        let mut current = String::new();
+        for character in raw_line.chars() {
+            current.push(character);
+            if current.chars().count() >= max_chars {
+                lines.push(current.trim_end().to_string());
+                current.clear();
+            }
+        }
+        if !current.is_empty() || raw_line.is_empty() {
+            lines.push(current.trim_end().to_string());
+        }
+    }
+    lines
+}
+
+fn pdf_utf16be_hex(value: &str) -> String {
+    let mut output = String::with_capacity(value.len() * 4 + 4);
+    output.push_str("FEFF");
+    for unit in value.encode_utf16() {
+        let _ = write!(output, "{unit:04X}");
+    }
+    output
+}
+
+fn handle_save_download_message_with_event(body: &str) -> (String, DownloadEvent) {
+    let message = match serde_json::from_str::<Value>(body) {
+        Ok(message) => message,
+        Err(error) => {
+            return (
+                ipc_error(None, format!("ignored invalid download IPC: {error}")),
+                DownloadEvent {
+                    kind: DownloadEventKind::Failed,
+                    status: "下载失败".to_string(),
+                    path: None,
+                    url: None,
+                    bytes: None,
+                    success: false,
+                },
+            );
+        }
+    };
+    let id = ipc_message_id(&message);
+    match save_download_payload(&message) {
+        Ok(payload) => {
+            let path = payload
+                .get("path")
+                .and_then(Value::as_str)
+                .map(PathBuf::from);
+            let bytes = payload.get("bytes").and_then(Value::as_u64);
+            (
+                ipc_ok(id.as_deref(), payload),
+                DownloadEvent {
+                    kind: DownloadEventKind::Completed,
+                    status: "下载完成".to_string(),
+                    path,
+                    url: None,
+                    bytes,
+                    success: true,
+                },
+            )
+        }
+        Err(error) => (
+            ipc_error(id.as_deref(), format!("{error:#}")),
+            DownloadEvent {
+                kind: DownloadEventKind::Failed,
+                status: "下载失败".to_string(),
+                path: None,
+                url: None,
+                bytes: None,
+                success: false,
+            },
+        ),
+    }
+}
+
+fn save_download_payload(message: &Value) -> Result<Value> {
+    let payload = message
+        .get("payload")
+        .context("saveDownload payload is missing")?;
+    let filename = payload
+        .get("filename")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("download");
+    let content_base64 = payload
+        .get("content_base64")
+        .and_then(Value::as_str)
+        .context("download content is missing")?;
+    let content_base64 = content_base64
+        .split_once(',')
+        .map(|(_, body)| body)
+        .unwrap_or(content_base64);
+    let bytes = BASE64
+        .decode(content_base64)
+        .context("download content is not valid base64")?;
+    let path = write_download_bytes(filename, &bytes)?;
+
+    Ok(json!({
+        "path": path.display().to_string(),
+        "bytes": bytes.len(),
+    }))
+}
+
+fn write_download_bytes(filename: &str, bytes: &[u8]) -> Result<PathBuf> {
+    let sanitized = sanitize_download_filename(filename);
+    let destination = download_destination_for(Path::new(&sanitized));
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("could not create download directory {}", parent.display()))?;
+    }
+    std::fs::write(&destination, bytes)
+        .with_context(|| format!("could not write download {}", destination.display()))?;
+    Ok(destination)
+}
+
+fn sanitize_download_filename(filename: &str) -> String {
+    let candidate = filename
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(filename)
+        .trim();
+    let mut sanitized = candidate
+        .chars()
+        .map(|character| match character {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' | '\0'..='\u{1f}' => '_',
+            character => character,
+        })
+        .collect::<String>();
+    while sanitized.ends_with([' ', '.']) {
+        sanitized.pop();
+    }
+
+    let reserved = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if sanitized.is_empty()
+        || reserved
+            .iter()
+            .any(|reserved| sanitized.eq_ignore_ascii_case(reserved))
+    {
+        sanitized = "download".to_string();
+    }
+
+    sanitized
+}
+
+fn reveal_download_path(path: &Path) -> Result<()> {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let target = if path.exists() {
+        path
+    } else {
+        path.parent()
+            .map(Path::to_path_buf)
+            .filter(|parent| parent.exists())
+            .context("download file or parent directory does not exist")?
+    };
+
+    open_path_in_file_manager(&target)
+}
+
+fn reveal_download_folder(path: &Path) -> Result<()> {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let folder = if path.is_dir() {
+        path
+    } else {
+        path.parent()
+            .map(Path::to_path_buf)
+            .filter(|parent| parent.exists())
+            .context("download parent directory does not exist")?
+    };
+
+    open_path_in_file_manager(&folder)
+}
+
+#[cfg(windows)]
+fn open_path_in_file_manager(path: &Path) -> Result<()> {
+    let status = unsafe {
+        windows_sys::Win32::UI::Shell::ShellExecuteW(
+            std::ptr::null_mut(),
+            wide_null("open").as_ptr(),
+            wide_null(&path.display().to_string()).as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        )
+    };
+    if (status as isize) <= 32 {
+        anyhow::bail!(
+            "could not open {}: ShellExecuteW returned {status:p}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn open_path_in_file_manager(path: &Path) -> Result<()> {
+    std::process::Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .with_context(|| format!("could not open {}", path.display()))?;
+    Ok(())
 }
 
 fn handle_ipc_value(message: &Value, state: &mut AppRuntimeState) -> Result<Value> {
@@ -1761,6 +4395,72 @@ fn parse_shell_command(body: &str) -> Option<Result<ShellCommand>> {
         "navBack" => Some(Ok(ShellCommand::NavBack)),
         "navForward" => Some(Ok(ShellCommand::NavForward)),
         "reloadActive" => Some(Ok(ShellCommand::ReloadActive)),
+        "openDownloadPath" => {
+            let path = message
+                .get("payload")
+                .and_then(|payload| payload.get("path"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            Some(if path.is_empty() {
+                Err(anyhow::anyhow!("download path is missing"))
+            } else {
+                Ok(ShellCommand::OpenDownloadPath(PathBuf::from(path)))
+            })
+        }
+        "openDownloadFolder" => {
+            let path = message
+                .get("payload")
+                .and_then(|payload| payload.get("path"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            Some(if path.is_empty() {
+                Err(anyhow::anyhow!("download path is missing"))
+            } else {
+                Ok(ShellCommand::OpenDownloadFolder(PathBuf::from(path)))
+            })
+        }
+        "openDownloadManager" => Some(Ok(ShellCommand::OpenDownloadManager)),
+        "closeDownloadManager" => Some(Ok(ShellCommand::CloseDownloadManager)),
+        "clearCompletedDownloads" => Some(Ok(ShellCommand::ClearCompletedDownloads)),
+        "deleteDownloadRecord" => {
+            let id = message
+                .get("payload")
+                .and_then(|payload| payload.get("id"))
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            Some(if id == 0 {
+                Err(anyhow::anyhow!("download record id is missing"))
+            } else {
+                Ok(ShellCommand::DeleteDownloadRecord(id))
+            })
+        }
+        "openDownloadSettings" => Some(Ok(ShellCommand::OpenDownloadSettings)),
+        "measureLatency" => {
+            let site = message
+                .get("payload")
+                .and_then(|payload| payload.get("site"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            Some(
+                AiSite::from_key(site)
+                    .map(ShellCommand::MeasureLatency)
+                    .ok_or_else(|| anyhow::anyhow!("unknown latency site: {site}")),
+            )
+        }
+        "exportConversation" => {
+            let format = message
+                .get("payload")
+                .and_then(|payload| payload.get("format"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            Some(
+                ExportFormat::from_key(format)
+                    .map(ShellCommand::ExportConversation)
+                    .ok_or_else(|| anyhow::anyhow!("unknown export format: {format}")),
+            )
+        }
         _ => None,
     }
 }
@@ -1816,6 +4516,49 @@ fn settings_button_script(settings_json: &str) -> String {
     });
   }
 
+  function notifyDownload(status, path, success = true) {
+    if (window.parent && typeof window.parent.__aiClientNotifyDownload === 'function') {
+      window.parent.__aiClientNotifyDownload({ status, path, success });
+    }
+  }
+
+  async function readDownloadUrl(url) {
+    const response = await fetch(url);
+    if (!response.ok && !url.startsWith('blob:') && !url.startsWith('data:')) {
+      throw new Error(`下载请求失败：${response.status}`);
+    }
+    const blob = await response.blob();
+    const buffer = await blob.arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(offset, offset + chunkSize));
+    }
+    return btoa(binary);
+  }
+
+  function installDownloadFallback() {
+    document.addEventListener('click', async event => {
+      const link = event.target && event.target.closest ? event.target.closest('a[download]') : null;
+      if (!link || !link.href) return;
+      const href = link.href;
+      if (!href.startsWith('blob:') && !href.startsWith('data:')) return;
+      if (!canUseNativeIpc()) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const filename = link.getAttribute('download') || 'download';
+      try {
+        notifyDownload('下载已开始', filename, true);
+        const content_base64 = await readDownloadUrl(href);
+        const result = await sendCommand('saveDownload', { filename, content_base64 });
+        notifyDownload('下载完成', result.path, true);
+      } catch (error) {
+        notifyDownload(error.message || '下载失败', filename, false);
+      }
+    }, true);
+  }
+
   function installSettingsButton() {
     if (document.getElementById('chatgpt-client-settings-button')) return;
     if (!document.body) return;
@@ -1858,6 +4601,13 @@ fn settings_button_script(settings_json: &str) -> String {
       }
       .cgpt-client-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
       .cgpt-client-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+      .cgpt-client-radio-row { display: flex; align-items: center; gap: 18px; flex-wrap: wrap; margin: 8px 0; }
+      .cgpt-client-radio-label { display: inline-flex !important; align-items: center; gap: 7px; margin: 0 !important; }
+      .cgpt-client-radio-label input { width: auto !important; min-height: auto !important; }
+      .cgpt-client-path-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: end; }
+      .cgpt-client-path-row label { margin: 0 !important; }
+      .cgpt-client-download-hint { margin: 5px 0 8px; color: #666; font-size: 12px; word-break: break-all; }
+      .cgpt-client-download-tools { display: flex; align-items: flex-end; justify-content: flex-end; gap: 8px; margin: 8px 0; }
       .cgpt-client-node-grid {
         display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 8px; margin-top: 8px;
       }
@@ -1982,6 +4732,33 @@ fn settings_button_script(settings_json: &str) -> String {
           <button class="cgpt-client-btn" type="button" data-action="refresh-subscription">刷新订阅</button>
         </div>
 
+        <h3 data-section="downloads">下载设置</h3>
+        <div class="cgpt-client-radio-row" aria-label="下载内容保存位置">
+          <label class="cgpt-client-radio-label">
+            <input data-field="download_save_mode" type="radio" name="download-save-mode" value="last_dir" />
+            使用上次下载目录
+          </label>
+          <label class="cgpt-client-radio-label">
+            <input data-field="download_save_mode" type="radio" name="download-save-mode" value="fixed" />
+            指定目录
+          </label>
+        </div>
+        <div class="cgpt-client-path-row">
+          <label>下载内容保存位置
+            <input data-field="download_fixed_dir" type="text" placeholder="data/Downloads" />
+          </label>
+          <button class="cgpt-client-btn" type="button" data-action="choose-download-dir">更改...</button>
+        </div>
+        <div class="cgpt-client-download-hint">上次下载目录：<span data-view="download_last_dir">暂无</span></div>
+        <div class="cgpt-client-grid">
+          <label>下载记录保留
+            <input data-field="download_max_records" type="number" min="50" max="5000" step="50" />
+          </label>
+          <div class="cgpt-client-download-tools">
+            <button class="cgpt-client-btn" type="button" data-action="reset-download-dir">恢复默认目录</button>
+          </div>
+        </div>
+
         <h3>节点选择</h3>
         <div class="cgpt-client-row">
           <select data-field="group_select"></select>
@@ -2028,6 +4805,9 @@ fn settings_button_script(settings_json: &str) -> String {
       mixed_port: panel.querySelector('[data-field="mixed_port"]'),
       controller_port: panel.querySelector('[data-field="controller_port"]'),
       group_select: panel.querySelector('[data-field="group_select"]'),
+      download_save_modes: [...panel.querySelectorAll('[data-field="download_save_mode"]')],
+      download_fixed_dir: panel.querySelector('[data-field="download_fixed_dir"]'),
+      download_max_records: panel.querySelector('[data-field="download_max_records"]'),
     };
     const views = {
       runtime: panel.querySelector('[data-view="runtime"]'),
@@ -2035,11 +4815,50 @@ fn settings_button_script(settings_json: &str) -> String {
       nodes: panel.querySelector('[data-view="nodes"]'),
       log: panel.querySelector('#chatgpt-client-log'),
       status: panel.querySelector('#chatgpt-client-settings-status'),
+      downloadLastDir: panel.querySelector('[data-view="download_last_dir"]'),
     };
     let subscriptions = [];
     let activeSubscriptionId = '';
+    let downloadSettings = normalizeDownloadSettings(initialSettings.downloads || {});
 
     function setStatus(text) { views.status.textContent = text || ''; }
+    function normalizeDownloadSettings(downloads = {}) {
+      const maxRecords = Number(downloads.max_records ?? 500);
+      return {
+        save_mode: downloads.save_mode === 'last_dir' ? 'last_dir' : 'fixed',
+        fixed_dir: String(downloads.fixed_dir || 'data/Downloads'),
+        last_dir: String(downloads.last_dir || ''),
+        ask_each_time: Boolean(downloads.ask_each_time),
+        max_records: Number.isFinite(maxRecords) ? Math.min(5000, Math.max(50, Math.round(maxRecords))) : 500,
+      };
+    }
+    function selectedDownloadSaveMode() {
+      return fields.download_save_modes.find(input => input.checked)?.value || downloadSettings.save_mode || 'fixed';
+    }
+    function syncDownloadFields() {
+      const mode = downloadSettings.save_mode === 'last_dir' ? 'last_dir' : 'fixed';
+      fields.download_save_modes.forEach(input => { input.checked = input.value === mode; });
+      fields.download_fixed_dir.value = downloadSettings.fixed_dir || 'data/Downloads';
+      fields.download_fixed_dir.disabled = mode === 'last_dir';
+      fields.download_max_records.value = String(downloadSettings.max_records || 500);
+      views.downloadLastDir.textContent = downloadSettings.last_dir || '暂无';
+      const chooseButton = panel.querySelector('[data-action="choose-download-dir"]');
+      if (chooseButton) chooseButton.disabled = mode === 'last_dir';
+    }
+    function setDownloadSettings(downloads) {
+      downloadSettings = normalizeDownloadSettings(downloads || {});
+      syncDownloadFields();
+    }
+    function readDownloadSettings() {
+      const maxRecords = Number(fields.download_max_records.value || downloadSettings.max_records || 500);
+      downloadSettings = normalizeDownloadSettings({
+        ...downloadSettings,
+        save_mode: selectedDownloadSaveMode(),
+        fixed_dir: fields.download_fixed_dir.value.trim() || 'data/Downloads',
+        max_records: maxRecords,
+      });
+      return { ...downloadSettings };
+    }
     function setSettings(settings) {
       fields.mode.value = settings.proxy.mode || 'system';
       subscriptions = normalizeSubscriptions(settings.proxy);
@@ -2050,6 +4869,7 @@ fn settings_button_script(settings_json: &str) -> String {
       fields.selected_proxy.value = settings.proxy.selected_proxy || '';
       fields.mixed_port.value = settings.proxy.mixed_port || 17898;
       fields.controller_port.value = settings.proxy.controller_port || 17899;
+      setDownloadSettings(settings.downloads || initialSettings.downloads || {});
     }
     function readSettings() {
       syncSubscriptionEditor();
@@ -2065,9 +4885,20 @@ fn settings_button_script(settings_json: &str) -> String {
           selected_proxy: fields.selected_proxy.value.trim(),
           mixed_port: Number(fields.mixed_port.value || 17898),
           controller_port: Number(fields.controller_port.value || 17899),
-        }
+        },
+        downloads: readDownloadSettings(),
       };
     }
+    window.__chatgptClientUpdateDownloadSettings = (updates = {}) => {
+      setDownloadSettings({ ...downloadSettings, ...updates });
+    };
+    window.__chatgptClientOpenSettings = (section) => {
+      panel.hidden = false;
+      if (section === 'downloads') {
+        panel.querySelector('[data-section="downloads"]')?.scrollIntoView({ block: 'start' });
+        fields.download_fixed_dir?.focus();
+      }
+    };
     function normalizeSubscriptions(proxy) {
       const list = Array.isArray(proxy.subscriptions) ? proxy.subscriptions : [];
       const normalized = list
@@ -2262,6 +5093,18 @@ fn settings_button_script(settings_json: &str) -> String {
       activeSubscriptionId = fields.subscription_select.value;
       renderSubscriptions();
     });
+    fields.download_save_modes.forEach(input => {
+      input.addEventListener('change', () => {
+        downloadSettings.save_mode = selectedDownloadSaveMode();
+        syncDownloadFields();
+      });
+    });
+    fields.download_fixed_dir.addEventListener('input', () => {
+      downloadSettings.fixed_dir = fields.download_fixed_dir.value;
+    });
+    fields.download_max_records.addEventListener('input', () => {
+      downloadSettings.max_records = Number(fields.download_max_records.value || 500);
+    });
     button.addEventListener('click', async () => {
       panel.hidden = !panel.hidden;
       if (!panel.hidden) {
@@ -2296,6 +5139,21 @@ fn settings_button_script(settings_json: &str) -> String {
           const result = await sendCommand('saveSettings', { settings: readSettings() });
           if (result.restarted) await refreshState();
           setStatus(result.restarted ? '订阅已删除并重启内置代理' : '订阅已删除');
+        } else if (action === 'choose-download-dir') {
+          const current = fields.download_fixed_dir.value.trim() || 'data/Downloads';
+          const next = window.prompt('请输入下载内容保存位置', current);
+          if (next != null) {
+            fields.download_fixed_dir.value = next.trim() || current;
+            downloadSettings.fixed_dir = fields.download_fixed_dir.value;
+            downloadSettings.save_mode = 'fixed';
+            syncDownloadFields();
+            setStatus('下载目录已更新，保存设置后生效');
+          }
+        } else if (action === 'reset-download-dir') {
+          downloadSettings.fixed_dir = 'data/Downloads';
+          downloadSettings.save_mode = 'fixed';
+          syncDownloadFields();
+          setStatus('已恢复默认下载目录，保存设置后生效');
         } else if (action === 'reload') {
           await refreshState();
         } else if (action === 'select-node') {
@@ -2355,6 +5213,7 @@ fn settings_button_script(settings_json: &str) -> String {
   } else {
     installSettingsButton();
   }
+  installDownloadFallback();
 })();
 "#;
 
@@ -2370,6 +5229,111 @@ fn apply_proxy_config<'a>(
     };
 
     builder.with_proxy_config(to_wry_proxy_config(proxy_settings))
+}
+
+fn download_destination_for(suggested_path: &Path) -> PathBuf {
+    let settings = load_settings();
+    download_destination_for_with_settings(suggested_path, &settings.downloads)
+}
+
+fn download_destination_for_with_settings(
+    suggested_path: &Path,
+    settings: &DownloadSettings,
+) -> PathBuf {
+    let filename = suggested_path
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_owned())
+        .unwrap_or_else(|| "download".into());
+    let mut destination = resolve_download_directory(settings);
+    if let Err(error) = ensure_download_directory_writable(&destination) {
+        eprintln!(
+            "could not create download directory {}: {error}",
+            destination.display()
+        );
+        destination = user_download_dir().join("EasyGPT");
+        let _ = std::fs::create_dir_all(&destination);
+    }
+    destination.push(filename);
+    unique_download_path(destination)
+}
+
+fn resolve_download_directory(settings: &DownloadSettings) -> PathBuf {
+    let fixed = settings.fixed_dir.trim();
+    let base_dir = chatgpt_webview_client::app_data_dir()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()));
+
+    match settings.save_mode {
+        DownloadSaveMode::LastDir if !settings.last_dir.trim().is_empty() => {
+            PathBuf::from(settings.last_dir.trim())
+        }
+        _ if fixed.is_empty() => base_dir.join("data").join("Downloads"),
+        _ => {
+            let path = PathBuf::from(fixed);
+            if path.is_absolute() {
+                path
+            } else {
+                base_dir.join(path)
+            }
+        }
+    }
+}
+
+fn ensure_download_directory_writable(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("could not create download directory {}", path.display()))?;
+    let probe = path.join(".easygpt-write-test");
+    std::fs::write(&probe, b"probe")
+        .with_context(|| format!("could not probe download directory {}", path.display()))?;
+    let _ = std::fs::remove_file(probe);
+    Ok(())
+}
+
+fn user_download_dir() -> PathBuf {
+    directories::UserDirs::new()
+        .and_then(|dirs| dirs.download_dir().map(Path::to_path_buf))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+fn unique_download_path(path: PathBuf) -> PathBuf {
+    if !path.exists() {
+        return path;
+    }
+
+    let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("download");
+    let extension = path.extension().and_then(|extension| extension.to_str());
+
+    for counter in 1..10_000 {
+        let filename = match extension {
+            Some(extension) if !extension.is_empty() => {
+                format!("{stem} ({counter}).{extension}")
+            }
+            _ => format!("{stem} ({counter})"),
+        };
+        let candidate = parent.join(filename);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    path
+}
+
+fn download_notification_script(status: &str, path: Option<&Path>, success: bool) -> String {
+    let payload = json!({
+        "status": status,
+        "path": path.map(|path| path.display().to_string()),
+        "success": success,
+    });
+    format!("window.__aiClientNotifyDownload && window.__aiClientNotifyDownload({payload});")
 }
 
 fn to_wry_proxy_config(proxy_settings: &ProxySettings) -> ProxyConfig {
@@ -2457,10 +5421,17 @@ fn wide_null(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AiSite, ShellCommand, content_bounds, parse_shell_command, runtime_ready_script_for_site,
+        AiSite, ExportFormat, ShellCommand, content_bounds, download_interceptor_script,
+        export_conversation_payload, export_conversation_script, export_markdown_document,
+        export_pdf_document, parse_shell_command, runtime_ready_script_for_site,
         settings_button_script, site_initial_url, top_shell_html, top_shell_url,
+        unique_download_path,
     };
-    use chatgpt_webview_client::{AppSettings, CHATGPT_URL, ProxyMode};
+    use chatgpt_webview_client::{
+        AppSettings, CHATGPT_URL, DownloadSaveMode, DownloadSettings, ProxyMode,
+    };
+    use serde_json::json;
+    use std::{fs, path::PathBuf};
 
     #[test]
     fn site_catalog_includes_all_top_tabs_in_order() {
@@ -2502,6 +5473,359 @@ mod tests {
         assert_eq!(
             bounds.size,
             wry::dpi::LogicalSize::new(1280.0, 848.0).into()
+        );
+    }
+
+    #[test]
+    fn unique_download_path_keeps_unused_filename() {
+        let path = PathBuf::from(r"C:\Users\tester\Downloads\report.pdf");
+
+        assert_eq!(unique_download_path(path.clone()), path);
+    }
+
+    #[test]
+    fn unique_download_path_adds_counter_for_existing_file() {
+        let dir =
+            std::env::temp_dir().join(format!("easygpt-download-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("report.pdf");
+        fs::write(&path, b"existing").expect("write temp file");
+
+        assert_eq!(unique_download_path(path), dir.join("report (1).pdf"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn download_destination_uses_suggested_filename() {
+        let destination = super::download_destination_for(PathBuf::from("report.pdf").as_path());
+
+        assert_eq!(
+            destination.file_name().and_then(|name| name.to_str()),
+            Some("report.pdf")
+        );
+        assert!(destination.is_absolute());
+    }
+
+    #[test]
+    fn download_destination_respects_fixed_absolute_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "easygpt-fixed-download-test-{}",
+            std::process::id()
+        ));
+        let settings = DownloadSettings {
+            save_mode: DownloadSaveMode::Fixed,
+            fixed_dir: dir.display().to_string(),
+            ..Default::default()
+        };
+
+        let destination = super::download_destination_for_with_settings(
+            PathBuf::from("report.pdf").as_path(),
+            &settings,
+        );
+
+        assert!(destination.starts_with(&dir));
+        assert_eq!(
+            destination.file_name().and_then(|name| name.to_str()),
+            Some("report.pdf")
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn download_destination_respects_last_directory_mode() {
+        let dir =
+            std::env::temp_dir().join(format!("easygpt-last-download-test-{}", std::process::id()));
+        let settings = DownloadSettings {
+            save_mode: DownloadSaveMode::LastDir,
+            last_dir: dir.display().to_string(),
+            ..Default::default()
+        };
+
+        let destination = super::download_destination_for_with_settings(
+            PathBuf::from("report.pdf").as_path(),
+            &settings,
+        );
+
+        assert!(destination.starts_with(&dir));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn content_initialization_script_installs_client_side_download_fallback() {
+        let script = download_interceptor_script();
+
+        assert!(script.contains("__chatgptClientDownloadInterceptorInstalled"));
+        assert!(script.contains("type: 'saveDownload'"));
+        assert!(script.contains("content_base64"));
+        assert!(script.contains("getAttribute('download')"));
+        assert!(script.contains("href.startsWith('blob:')"));
+        assert!(script.contains("href.startsWith('data:')"));
+        assert!(script.contains("window.open = function"));
+    }
+
+    #[test]
+    fn download_interceptor_supports_file_system_access_api_fallback() {
+        let script = download_interceptor_script();
+
+        assert!(script.contains("window.showSaveFilePicker"));
+        assert!(script.contains("__aiClientNativeShowSaveFilePicker"));
+        assert!(script.contains("createWritable"));
+        assert!(script.contains("async close() { return flush(); }"));
+        assert!(script.contains("navigator.msSaveBlob"));
+    }
+
+    #[test]
+    fn save_download_payload_writes_base64_content() {
+        let message = json!({
+            "id": "download-1",
+            "type": "saveDownload",
+            "payload": {
+                "filename": "codex-download-test.txt",
+                "content_base64": "aGVsbG8="
+            }
+        });
+
+        let payload = super::save_download_payload(&message).expect("download should save");
+        let path = PathBuf::from(payload["path"].as_str().expect("path should be returned"));
+        let bytes = fs::read(&path).expect("saved file should exist");
+
+        assert_eq!(bytes, b"hello");
+        assert_eq!(payload["bytes"], 5);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_download_payload_accepts_data_url_prefixed_base64() {
+        let message = json!({
+            "type": "saveDownload",
+            "payload": {
+                "filename": "easygpt-data-url-test.txt",
+                "content_base64": "data:text/plain;base64,aGVsbG8="
+            }
+        });
+
+        let payload = super::save_download_payload(&message).expect("download should save");
+        let path = PathBuf::from(payload["path"].as_str().expect("path should be returned"));
+
+        assert_eq!(fs::read(&path).expect("saved file should exist"), b"hello");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_download_payload_sanitizes_windows_forbidden_filename_chars() {
+        let message = json!({
+            "type": "saveDownload",
+            "payload": {
+                "filename": r#"folder\bad:name?.txt"#,
+                "content_base64": "aGVsbG8="
+            }
+        });
+
+        let payload = super::save_download_payload(&message).expect("download should save");
+        let path = PathBuf::from(payload["path"].as_str().expect("path should be returned"));
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+
+        assert!(filename.starts_with("bad_name_"));
+        assert!(!filename.contains(':'));
+        assert!(!filename.contains('?'));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_download_message_reports_completion_event() {
+        let message = json!({
+            "id": "download-2",
+            "type": "saveDownload",
+            "payload": {
+                "filename": "codex-download-event-test.txt",
+                "content_base64": "aGVsbG8="
+            }
+        });
+
+        let (response, event) =
+            super::handle_save_download_message_with_event(&message.to_string());
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("response is json");
+        let path = event.path.clone().expect("event should include saved path");
+
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(event.status, "下载完成");
+        assert!(event.success);
+        assert!(path.exists());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn download_diagnostic_ipc_reports_visible_error() {
+        let event = super::parse_download_diagnostic_event(
+            r#"{"type":"downloadDiagnostic","payload":{"level":"error","message":"script failed"}}"#,
+        )
+        .expect("diagnostic event");
+
+        assert_eq!(event.status, "下载诊断：script failed");
+        assert!(!event.success);
+    }
+
+    #[test]
+    fn download_history_records_started_and_completed_items() {
+        let mut history = super::DownloadHistory::default();
+        let path = PathBuf::from(r"C:\Users\tester\Downloads\report.docx");
+
+        history.record(super::DownloadEvent {
+            kind: super::DownloadEventKind::Started,
+            status: "下载已开始".to_string(),
+            path: Some(path.clone()),
+            url: Some("https://example.com/report.docx".to_string()),
+            bytes: None,
+            success: true,
+        });
+        history.record(super::DownloadEvent {
+            kind: super::DownloadEventKind::Completed,
+            status: "下载完成".to_string(),
+            path: Some(path.clone()),
+            url: Some("https://example.com/report.docx".to_string()),
+            bytes: Some(42),
+            success: true,
+        });
+
+        let payload = history.payload();
+        assert_eq!(payload["downloads"][0]["filename"], "report.docx");
+        assert_eq!(payload["downloads"][0]["status"], "completed");
+        assert_eq!(payload["downloads"][0]["path"], path.display().to_string());
+        assert_eq!(payload["downloads"][0]["bytes"], 42);
+    }
+
+    #[test]
+    fn download_history_store_round_trips_completed_records() {
+        let mut history = super::DownloadHistory::new(500);
+        let path = PathBuf::from(r"C:\Users\tester\Downloads\report.xlsx");
+        history.record(super::DownloadEvent {
+            kind: super::DownloadEventKind::Completed,
+            status: "下载完成".to_string(),
+            path: Some(path.clone()),
+            url: Some("https://example.com/report.xlsx".to_string()),
+            bytes: Some(12),
+            success: true,
+        });
+
+        let store = super::download_history_store(&history);
+        let encoded = serde_json::to_string(&store).expect("store should serialize");
+        let decoded = serde_json::from_str::<super::DownloadHistoryStore>(&encoded)
+            .expect("store should deserialize");
+        let restored = super::download_history_from_store(decoded, 500);
+
+        assert_eq!(restored.records.len(), 1);
+        assert_eq!(restored.records[0].filename, "report.xlsx");
+        assert_eq!(
+            restored.records[0].status,
+            super::DownloadRecordStatus::Completed
+        );
+    }
+
+    #[test]
+    fn download_history_load_marks_previous_started_as_failed() {
+        let store = super::DownloadHistoryStore {
+            version: 1,
+            next_id: 1,
+            records: vec![super::DownloadRecord {
+                id: 1,
+                filename: "unfinished.zip".to_string(),
+                status: super::DownloadRecordStatus::Started,
+                path: Some(PathBuf::from(r"C:\Downloads\unfinished.zip")),
+                url: None,
+                bytes: None,
+                message: "下载已开始".to_string(),
+                timestamp_ms: 1,
+            }],
+        };
+
+        let history = super::download_history_from_store(store, 500);
+
+        assert_eq!(
+            history.records[0].status,
+            super::DownloadRecordStatus::Failed
+        );
+        assert_eq!(history.records[0].message, "上次退出时下载未完成");
+    }
+
+    #[test]
+    fn download_history_load_caps_records() {
+        let records = (0..3)
+            .map(|id| super::DownloadRecord {
+                id,
+                filename: format!("file-{id}.txt"),
+                status: super::DownloadRecordStatus::Completed,
+                path: None,
+                url: None,
+                bytes: None,
+                message: "下载完成".to_string(),
+                timestamp_ms: u128::from(id),
+            })
+            .collect();
+        let store = super::DownloadHistoryStore {
+            version: 1,
+            next_id: 3,
+            records,
+        };
+
+        let history = super::download_history_from_store(store, 2);
+
+        assert_eq!(history.records.len(), 2);
+    }
+
+    #[test]
+    fn download_history_clear_completed_keeps_failed_records() {
+        let mut history = super::DownloadHistory::new(500);
+        history.records = vec![
+            super::DownloadRecord {
+                id: 1,
+                filename: "done.txt".to_string(),
+                status: super::DownloadRecordStatus::Completed,
+                path: None,
+                url: None,
+                bytes: None,
+                message: "下载完成".to_string(),
+                timestamp_ms: 1,
+            },
+            super::DownloadRecord {
+                id: 2,
+                filename: "failed.txt".to_string(),
+                status: super::DownloadRecordStatus::Failed,
+                path: None,
+                url: None,
+                bytes: None,
+                message: "下载失败".to_string(),
+                timestamp_ms: 2,
+            },
+            super::DownloadRecord {
+                id: 3,
+                filename: "diagnostic.txt".to_string(),
+                status: super::DownloadRecordStatus::Diagnostic,
+                path: None,
+                url: None,
+                bytes: None,
+                message: "下载诊断".to_string(),
+                timestamp_ms: 3,
+            },
+        ];
+
+        history.clear_completed();
+
+        assert_eq!(history.records.len(), 2);
+        assert!(
+            history
+                .records
+                .iter()
+                .all(|record| record.status != super::DownloadRecordStatus::Completed)
         );
     }
 
@@ -2559,10 +5883,226 @@ mod tests {
     }
 
     #[test]
+    fn top_shell_html_exposes_download_toast_api() {
+        let html = top_shell_html(AiSite::ChatGpt);
+
+        assert!(html.contains("class=\"toast-region\""));
+        assert!(html.contains("window.__aiClientNotifyDownload"));
+        assert!(html.contains("detail.dataset.action = 'openDownloadPath';"));
+        assert!(html.contains("sendCommand('openDownloadPath'"));
+    }
+
+    #[test]
+    fn top_shell_html_exposes_download_self_test_button() {
+        let html = top_shell_html(AiSite::ChatGpt);
+
+        assert!(!html.contains("data-action=\"testDownload\""));
+        assert!(!html.contains("下载自测"));
+    }
+
+    #[test]
+    fn top_shell_download_manager_opens_native_window() {
+        let html = top_shell_html(AiSite::ChatGpt);
+
+        assert!(html.contains("data-action=\"openDownloadManager\""));
+        assert!(html.contains("sendCommand('openDownloadManager')"));
+        assert!(!html.contains("class=\"download-overlay\""));
+        assert!(!html.contains("setDownloadManagerOpen"));
+    }
+
+    #[test]
+    fn top_shell_html_exposes_latency_status_and_timer() {
+        let html = top_shell_html(AiSite::ChatGpt);
+
+        assert!(html.contains("data-latency-label"));
+        assert!(html.contains("延时 --"));
+        assert!(html.contains("measureLatency"));
+        assert!(html.contains("setInterval(measureActiveLatency, 60000)"));
+    }
+
+    #[test]
+    fn top_shell_html_does_not_probe_latency_during_first_second() {
+        let html = top_shell_html(AiSite::ChatGpt);
+
+        assert!(!html.contains("setTimeout(measureActiveLatency, 800)"));
+        assert!(html.contains("setTimeout(measureActiveLatency, 5000)"));
+    }
+
+    #[test]
+    fn top_shell_html_latency_pill_has_stable_width() {
+        let html = top_shell_html(AiSite::ChatGpt);
+
+        assert!(html.contains("class=\"pill latency-pill\""));
+        assert!(html.contains(".latency-pill {"));
+        assert!(html.contains("min-width: 104px;"));
+        assert!(html.contains("justify-content: center;"));
+    }
+
+    #[test]
+    fn top_shell_html_exposes_download_manager_panel() {
+        let html = top_shell_html(AiSite::ChatGpt);
+
+        assert!(html.contains("data-action=\"openDownloadManager\""));
+        assert!(!html.contains("data-download-filter"));
+        assert!(!html.contains("data-download-list"));
+        assert!(!html.contains("data-action=\"testDownload\""));
+    }
+
+    #[test]
+    fn download_manager_html_wires_native_window_buttons() {
+        let history = super::DownloadHistory::new(500);
+        let html = super::download_manager_html(&history);
+
+        assert!(html.contains("<title>下载管理</title>"));
+        assert!(html.contains("data-download-filter"));
+        assert!(html.contains("data-download-list"));
+        assert!(html.contains("data-download-summary"));
+        assert!(html.contains("data-action=\"openDownloadSettings\""));
+        assert!(html.contains("data-action=\"clearCompletedDownloads\""));
+        assert!(html.contains("data-action=\"closeDownloadManager\""));
+        assert!(html.contains("data-action=\"openDownloadPath\""));
+        assert!(html.contains("data-action=\"openDownloadFolder\""));
+        assert!(html.contains("data-action=\"deleteDownloadRecord\""));
+        assert!(html.contains("window.__aiClientSyncDownloads"));
+        assert!(html.contains("sendCommand('closeDownloadManager')"));
+    }
+
+    #[test]
+    fn top_shell_html_exposes_conversation_export_buttons() {
+        let html = top_shell_html(AiSite::ChatGpt);
+
+        assert!(html.contains("data-action=\"exportMarkdown\""));
+        assert!(html.contains("data-action=\"exportPdf\""));
+        assert!(html.contains("exportConversation"));
+        assert!(html.contains("title=\"导出 Markdown\""));
+        assert!(html.contains("title=\"导出 PDF\""));
+    }
+
+    #[test]
+    fn rendered_pdf_filename_uses_site_name() {
+        assert_eq!(
+            super::rendered_pdf_filename(AiSite::NotebookLm),
+            "NotebookLM-page-export.pdf"
+        );
+    }
+
+    #[test]
+    fn top_shell_toast_is_visible_inside_fixed_toolbar_height() {
+        let html = top_shell_html(AiSite::ChatGpt);
+
+        assert!(html.contains(".toast-region { position: fixed; right: 12px; top: 8px;"));
+        assert!(!html.contains("top: 60px"));
+    }
+
+    #[test]
+    fn export_conversation_script_posts_markdown_to_rust() {
+        let script = export_conversation_script(AiSite::ChatGpt, ExportFormat::Markdown);
+
+        assert!(script.contains("type: 'exportConversation'"));
+        assert!(script.contains("const format = 'markdown';"));
+        assert!(script.contains("extractConversationMarkdown"));
+        assert!(script.contains("data-message-author-role"));
+    }
+
+    #[test]
+    fn export_markdown_document_includes_metadata_and_content() {
+        let markdown = export_markdown_document("ChatGPT", "https://chatgpt.com/c/1", "hello");
+
+        assert!(markdown.contains("# ChatGPT"));
+        assert!(markdown.contains("来源：<https://chatgpt.com/c/1>"));
+        assert!(markdown.contains("hello"));
+    }
+
+    #[test]
+    fn export_pdf_document_creates_pdf_bytes() {
+        let pdf = export_pdf_document("ChatGPT", "# ChatGPT\n\nhello");
+
+        assert!(pdf.starts_with(b"%PDF-1.4"));
+        assert!(String::from_utf8_lossy(&pdf).contains("%%EOF"));
+    }
+
+    #[test]
+    fn export_pdf_document_does_not_replace_chinese_with_question_marks() {
+        let pdf = export_pdf_document("ChatGPT", "# ChatGPT\n\n## 用户\n\n你好，导出测试");
+        let rendered = String::from_utf8_lossy(&pdf);
+
+        assert!(!rendered.contains("??"));
+        assert!(!rendered.contains("????"));
+    }
+
+    #[test]
+    fn export_conversation_payload_writes_markdown_file() {
+        let message = json!({
+            "id": "export-1",
+            "type": "exportConversation",
+            "payload": {
+                "format": "markdown",
+                "site_title": "ChatGPT",
+                "url": "https://chatgpt.com/c/1",
+                "markdown": "## 用户\n\nhello"
+            }
+        });
+
+        let payload = export_conversation_payload(&message).expect("export should save");
+        let path = PathBuf::from(payload["path"].as_str().expect("path should be returned"));
+
+        assert_eq!(payload["format"], "markdown");
+        assert!(path.exists());
+        assert_eq!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("md")
+        );
+        assert!(
+            fs::read_to_string(&path)
+                .expect("markdown should be readable")
+                .contains("## 用户")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn export_conversation_payload_writes_pdf_file() {
+        let message = json!({
+            "id": "export-2",
+            "type": "exportConversation",
+            "payload": {
+                "format": "pdf",
+                "site_title": "ChatGPT",
+                "url": "https://chatgpt.com/c/1",
+                "markdown": "## User\n\nhello"
+            }
+        });
+
+        let payload = export_conversation_payload(&message).expect("export should save");
+        let path = PathBuf::from(payload["path"].as_str().expect("path should be returned"));
+        let bytes = fs::read(&path).expect("pdf should be readable");
+
+        assert_eq!(payload["format"], "pdf");
+        assert_eq!(
+            path.extension().and_then(|value| value.to_str()),
+            Some("pdf")
+        );
+        assert!(bytes.starts_with(b"%PDF-1.4"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn download_notification_script_escapes_payload() {
+        let path = PathBuf::from(r#"C:\Users\tester\Downloads\a"b.txt"#);
+        let script = super::download_notification_script("完成", Some(path.as_path()), true);
+
+        assert!(script.contains("window.__aiClientNotifyDownload"));
+        assert!(script.contains(r#"C:\\Users\\tester\\Downloads\\a\"b.txt"#));
+    }
+
+    #[test]
     fn top_shell_loads_from_non_opaque_origin_for_ipc() {
         let url = top_shell_url();
 
         assert!(url.starts_with("aiclient://"));
+        assert!(url.contains("?v=download-manager-native-v2"));
         assert!(!url.starts_with("data:"));
         assert_ne!(url, "about:blank");
     }
@@ -2603,6 +6143,106 @@ mod tests {
             .expect("valid optimize command");
 
         assert_eq!(command, ShellCommand::OptimizeMemory);
+    }
+
+    #[test]
+    fn parse_shell_command_recognizes_open_download_path() {
+        let command = parse_shell_command(
+            r#"{"id":"5","type":"openDownloadPath","payload":{"path":"C:\\Users\\tester\\Downloads\\report.md"}}"#,
+        )
+        .expect("shell command")
+        .expect("valid open path command");
+
+        assert_eq!(
+            command,
+            ShellCommand::OpenDownloadPath(PathBuf::from(r#"C:\Users\tester\Downloads\report.md"#))
+        );
+    }
+
+    #[test]
+    fn parse_shell_command_recognizes_open_download_folder() {
+        let command = parse_shell_command(
+            r#"{"id":"6","type":"openDownloadFolder","payload":{"path":"C:\\Users\\tester\\Downloads\\report.md"}}"#,
+        )
+        .expect("shell command")
+        .expect("valid open folder command");
+
+        assert_eq!(
+            command,
+            ShellCommand::OpenDownloadFolder(PathBuf::from(
+                r#"C:\Users\tester\Downloads\report.md"#
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_shell_command_recognizes_download_manager_commands() {
+        assert_eq!(
+            parse_shell_command(r#"{"id":"7","type":"openDownloadManager"}"#)
+                .expect("shell command")
+                .expect("valid command"),
+            ShellCommand::OpenDownloadManager
+        );
+        assert_eq!(
+            parse_shell_command(r#"{"id":"7","type":"closeDownloadManager"}"#)
+                .expect("shell command")
+                .expect("valid command"),
+            ShellCommand::CloseDownloadManager
+        );
+        assert_eq!(
+            parse_shell_command(r#"{"id":"8","type":"clearCompletedDownloads"}"#)
+                .expect("shell command")
+                .expect("valid command"),
+            ShellCommand::ClearCompletedDownloads
+        );
+        assert_eq!(
+            parse_shell_command(r#"{"id":"9","type":"deleteDownloadRecord","payload":{"id":12}}"#)
+                .expect("shell command")
+                .expect("valid command"),
+            ShellCommand::DeleteDownloadRecord(12)
+        );
+        assert_eq!(
+            parse_shell_command(r#"{"id":"10","type":"openDownloadSettings"}"#)
+                .expect("shell command")
+                .expect("valid command"),
+            ShellCommand::OpenDownloadSettings
+        );
+    }
+
+    #[test]
+    fn parse_shell_command_recognizes_latency_measurement() {
+        let command = parse_shell_command(
+            r#"{"id":"9","type":"measureLatency","payload":{"site":"gemini"}}"#,
+        )
+        .expect("shell command")
+        .expect("valid latency command");
+
+        assert_eq!(command, ShellCommand::MeasureLatency(AiSite::Gemini));
+    }
+
+    #[test]
+    fn parse_shell_command_recognizes_export_markdown() {
+        let command = parse_shell_command(
+            r#"{"id":"5","type":"exportConversation","payload":{"format":"markdown"}}"#,
+        )
+        .expect("shell command")
+        .expect("valid export command");
+
+        assert_eq!(
+            command,
+            ShellCommand::ExportConversation(ExportFormat::Markdown)
+        );
+    }
+
+    #[test]
+    fn parse_shell_command_recognizes_export_pdf() {
+        let command = parse_shell_command(
+            r#"{"id":"6","type":"exportConversation","payload":{"format":"pdf"}}"#,
+        )
+        .expect("shell command")
+        .expect("valid export command");
+
+        assert_eq!(command, ShellCommand::ExportConversation(ExportFormat::Pdf));
     }
 
     #[test]
@@ -2655,6 +6295,58 @@ mod tests {
         assert!(script.contains("data-action=\"optimize-memory\""));
         assert!(script.contains("optimizeMemory"));
         assert!(script.contains("后台页面"));
+    }
+
+    #[test]
+    fn settings_script_exposes_download_path_controls() {
+        let script = settings_button_script(r#"{"proxy":{},"downloads":{}}"#);
+
+        assert!(script.contains("下载内容保存位置"));
+        assert!(script.contains("使用上次下载目录"));
+        assert!(script.contains("data-field=\"download_save_mode\""));
+        assert!(script.contains("data-field=\"download_fixed_dir\""));
+        assert!(script.contains("data-field=\"download_max_records\""));
+        assert!(script.contains("data-action=\"choose-download-dir\""));
+        assert!(script.contains("window.__chatgptClientUpdateDownloadSettings"));
+    }
+
+    #[test]
+    fn settings_script_intercepts_blob_and_data_download_links() {
+        let script = download_interceptor_script();
+
+        assert!(script.contains("__chatgptClientDownloadInterceptorInstalled"));
+        assert!(script.contains("a[href]"));
+        assert!(script.contains("href.startsWith('blob:')"));
+        assert!(script.contains("href.startsWith('data:')"));
+        assert!(script.contains("saveDownload"));
+        assert!(script.contains("content_base64"));
+    }
+
+    #[test]
+    fn download_interceptor_handles_programmatic_anchor_clicks() {
+        let script = download_interceptor_script();
+
+        assert!(script.contains("HTMLAnchorElement.prototype.click"));
+        assert!(script.contains("nativeAnchorClick"));
+        assert!(script.contains("handleDownloadAnchor"));
+        assert!(script.contains("return nativeAnchorClick.apply(this, arguments);"));
+    }
+
+    #[test]
+    fn save_download_payload_writes_base64_file() {
+        let message = json!({
+            "type": "saveDownload",
+            "payload": {
+                "filename": "easygpt-test-download.txt",
+                "content_base64": "aGVsbG8="
+            }
+        });
+
+        let payload = super::save_download_payload(&message).expect("save download");
+        let path = PathBuf::from(payload["path"].as_str().expect("path"));
+
+        assert_eq!(fs::read(&path).expect("read saved file"), b"hello");
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -2762,6 +6454,91 @@ mod tests {
     }
 
     #[test]
+    fn runtime_failed_script_replaces_waiting_page_with_error() {
+        let script = super::runtime_failed_script("missing mihomo.exe");
+
+        assert!(script.contains("内置代理启动失败"));
+        assert!(script.contains("missing mihomo.exe"));
+        assert!(script.contains(r#"resources\\clash\\mihomo.exe"#));
+        assert!(script.contains("document.body.innerHTML = '';"));
+    }
+
+    #[test]
+    fn startup_stage_has_user_facing_labels() {
+        assert_eq!(super::StartupStage::all().len(), 10);
+        assert_eq!(
+            super::StartupStage::LoadSubscription.key(),
+            "load_subscription"
+        );
+        assert_eq!(
+            super::StartupStage::LoadSubscription.label(),
+            "读取或更新订阅"
+        );
+        assert_eq!(
+            super::StartupStage::WaitController.label(),
+            "等待控制器就绪"
+        );
+        assert_eq!(super::StartupStage::Failed.key(), "failed");
+    }
+
+    #[test]
+    fn startup_progress_script_updates_waiting_page() {
+        let script = super::startup_progress_script(&super::StartupProgress {
+            stage: super::StartupStage::StartMihomo,
+            elapsed_secs: 8,
+            message: Some("starting".to_string()),
+        });
+
+        assert!(script.contains("data-startup-stage"));
+        assert!(script.contains("data-startup-elapsed"));
+        assert!(script.contains("启动 mihomo"));
+        assert!(script.contains("starting"));
+    }
+
+    #[test]
+    fn initial_runtime_start_spawns_once_only_for_internal_clash() {
+        assert!(super::should_spawn_initial_runtime_start(
+            ProxyMode::InternalClash,
+            false
+        ));
+        assert!(!super::should_spawn_initial_runtime_start(
+            ProxyMode::InternalClash,
+            true
+        ));
+        assert!(!super::should_spawn_initial_runtime_start(
+            ProxyMode::System,
+            false
+        ));
+    }
+
+    #[test]
+    fn waiting_page_keeps_elapsed_timer_without_native_events() {
+        let url = super::waiting_page_url(AiSite::ChatGpt);
+        let decoded = urlencoding::decode(
+            url.strip_prefix("data:text/html;charset=utf-8,")
+                .expect("waiting page should be a data URL"),
+        )
+        .expect("waiting page should decode");
+
+        assert!(decoded.contains("const startupStartedAt = Date.now();"));
+        assert!(decoded.contains("setInterval(() => {"));
+        assert!(decoded.contains("data-startup-elapsed"));
+    }
+
+    #[test]
+    fn waiting_page_bootstraps_initial_startup_stage() {
+        let url = super::waiting_page_url(AiSite::ChatGpt);
+        let decoded = urlencoding::decode(
+            url.strip_prefix("data:text/html;charset=utf-8,")
+                .expect("waiting page should be a data URL"),
+        )
+        .expect("waiting page should decode");
+
+        assert!(decoded.contains("data-startup-stage>读取配置</strong>"));
+        assert!(decoded.contains("data-startup-elapsed>0</span>s"));
+    }
+
+    #[test]
     fn internal_clash_starts_with_local_waiting_page() {
         let mut settings = AppSettings::default();
         settings.proxy.mode = ProxyMode::InternalClash;
@@ -2774,6 +6551,9 @@ mod tests {
                 "%E6%AD%A3%E5%9C%A8%E5%90%AF%E5%8A%A8%E5%86%85%E7%BD%AE%E4%BB%A3%E7%90%86"
             )
         );
+        assert!(url.contains("data-startup-stage"));
+        assert!(url.contains("%E8%B7%B3%E8%BF%87%E4%BB%A3%E7%90%86%E6%89%93%E5%BC%80"));
+        assert!(url.contains("https%3A%2F%2Fchatgpt.com"));
     }
 
     #[test]

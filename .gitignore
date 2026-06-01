@@ -13,6 +13,10 @@
 # Temporary local test servers and scratch outputs.
 /tmp_subscription_server/
 /tmp*/
+/cdp-list.json
+/debug-*.log
+/debug-stdout.log
+/debug-stderr.log
 
 # Windows and editor noise.
 Thumbs.db
