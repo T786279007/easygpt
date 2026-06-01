@@ -1292,7 +1292,7 @@ fn runtime_failed_script(error_message: &str) -> String {
     let payload = json!({
         "title": "内置代理启动失败",
         "message": error_message,
-        "hint": "请确认程序目录里存在 resources\\clash\\mihomo.exe，或重新解压完整便携版目录后启动。",
+        "hint": "请确认程序包里存在 resources/clash/mihomo，或重新解压完整安装包/便携包后启动。",
     });
     format!(
         r#"
@@ -3899,7 +3899,16 @@ fn open_path_in_file_manager(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn open_path_in_file_manager(path: &Path) -> Result<()> {
+    std::process::Command::new("open")
+        .arg(path)
+        .spawn()
+        .with_context(|| format!("could not open {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 fn open_path_in_file_manager(path: &Path) -> Result<()> {
     std::process::Command::new("xdg-open")
         .arg(path)
@@ -6455,11 +6464,11 @@ mod tests {
 
     #[test]
     fn runtime_failed_script_replaces_waiting_page_with_error() {
-        let script = super::runtime_failed_script("missing mihomo.exe");
+        let script = super::runtime_failed_script("missing mihomo");
 
         assert!(script.contains("内置代理启动失败"));
-        assert!(script.contains("missing mihomo.exe"));
-        assert!(script.contains(r#"resources\\clash\\mihomo.exe"#));
+        assert!(script.contains("missing mihomo"));
+        assert!(script.contains("resources/clash/mihomo"));
         assert!(script.contains("document.body.innerHTML = '';"));
     }
 

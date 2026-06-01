@@ -1,6 +1,6 @@
 param(
     [string]$Destination = "",
-    [string]$AssetPattern = "mihomo-windows-amd64-v2-*.zip",
+    [string]$AssetPattern = "mihomo-windows-amd64-compatible-v*.zip",
     [switch]$Force
 )
 

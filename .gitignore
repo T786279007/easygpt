@@ -9,6 +9,7 @@
 
 # Downloaded during packaging. Do not store large proxy-core binaries in Git.
 /resources/clash/mihomo.exe
+/resources/clash/mihomo
 
 # Temporary local test servers and scratch outputs.
 /tmp_subscription_server/

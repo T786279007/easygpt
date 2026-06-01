@@ -1,6 +1,6 @@
 [package]
 name = "chatgpt_webview_client"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A lightweight ChatGPT desktop client using Rust, Wry, and WebView2."
 

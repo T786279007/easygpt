@@ -1,37 +1,37 @@
-# EasyGPT Conversation Export Design
+# EasyGPT 对话导出设计
 
-## Goal
+## 目标
 
-Add a top-toolbar export action that saves the currently visible AI conversation as Markdown or PDF-oriented HTML without relying on the web site's own download behavior.
+在顶部工具栏增加导出按钮，将当前可见 AI 对话保存为 Markdown 或 PDF，而不是依赖网站自身的下载功能。
 
-## Approach
+## 方案
 
-The toolbar sends an export command to Rust. Rust injects a page extraction script into the active WebView. The script reads visible conversation text from common ChatGPT, Gemini, NotebookLM, and AI Studio DOM patterns, falls back to readable `main`/`article` text, and returns structured Markdown through IPC. Rust saves the result through the same native download writer used by the download self-test.
+顶部工具栏向 Rust 发送导出命令。Rust 向当前活跃 WebView 注入提取脚本，脚本从 ChatGPT、Gemini、NotebookLM、AI Studio 的常见 DOM 结构中读取可见对话文本；如果没有匹配到专用结构，则退回读取 `main` 或 `article` 的可读文本。
 
-PDF export uses a deterministic HTML document saved beside Markdown. This avoids brittle silent print dialogs while still producing a PDF-ready document that the user can open and print to PDF.
+Markdown 通过 IPC 返回给 Rust，由 Rust 使用统一下载写入逻辑保存。PDF 优先使用平台原生页面打印能力；不可用时使用内置 PDF 回退生成。
 
-## Failure Handling
+## 失败处理
 
-Every export path must produce a toast:
+所有导出路径都必须给出可见提示：
 
-- Success: saved path is shown.
-- Empty extraction: visible error says no conversation was recognized.
-- IPC/script failure: visible diagnostic toast.
-- Invalid filename: Rust sanitizes names before writing.
+- 成功：显示保存路径，并写入下载中心。
+- 提取为空：提示未识别到可导出的对话内容。
+- IPC 或脚本失败：显示诊断错误。
+- 文件名非法：Rust 负责清理文件名。
 
-## Tests
+## 测试
 
-- Shell parses Markdown/PDF export commands.
-- Toolbar exposes export controls.
-- Export Markdown builder escapes content and includes metadata.
-- Export HTML builder wraps Markdown-derived content in printable HTML.
-- Save path works through native writer and tolerates existing filenames.
-- Download regressions remain covered.
+- shell 能解析 Markdown 和 PDF 导出命令。
+- 顶部工具栏展示导出按钮。
+- Markdown 构建会转义内容并包含元数据。
+- PDF 回退路径可生成文件。
+- 保存路径能处理同名文件。
+- 下载功能回归测试继续覆盖。
 
-## Adversarial Review Notes
+## 对抗式审阅要点
 
-- Do not call the site's own download button.
-- Do not depend on one ChatGPT DOM selector.
-- Do not silently ignore extraction errors.
-- Do not write raw site HTML into Markdown without escaping.
-- Do not assume exact filename when duplicates exist.
+- 不调用网页自身下载按钮。
+- 不依赖单一 ChatGPT DOM 选择器。
+- 不静默吞掉提取错误。
+- 不把原始网页 HTML 直接写入 Markdown。
+- 不假设文件名唯一。

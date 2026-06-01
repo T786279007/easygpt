@@ -1,71 +1,72 @@
-# v0.4 Efficiency Upgrade Implementation Plan
+# v0.4 效率升级实施计划
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **给 Claude/Codex：** 按任务逐项执行，所有任务完成后统一验证。
 
-**Goal:** Make the ChatGPT desktop client more reliable and faster to operate by stabilizing the internal proxy, improving startup behavior, reducing runtime lock contention, and adding efficient node/status controls.
+**目标：** 提升 ChatGPT 桌面客户端的启动稳定性和操作效率，重点解决内置代理、启动体验、运行锁竞争和节点操作效率问题。
 
-**Architecture:** Keep WebView2 pointed at the configured app-local proxy port when internal Clash mode is enabled, so mihomo restarts do not invalidate the WebView proxy. Store runtime errors in app state instead of failing process startup, expose healthier status payloads through IPC, and move interactive node testing into the injected UI with incremental updates.
+**架构：** 内置代理模式下，WebView 始终指向应用本地 mixed 代理端口。mihomo 启动失败不直接退出程序，而是进入可诊断状态。节点测速和交互通过设置面板增量更新，避免阻塞主线程。
 
-**Tech Stack:** Rust 2024, Wry/WebView2, tao, reqwest blocking client, mihomo controller HTTP API, injected vanilla JavaScript UI.
+**技术栈：** Rust 2024、Wry/WebView、Tao、reqwest、mihomo Controller API、原生 JavaScript 设置面板。
 
 ---
 
-### Task 1: Fixed Internal Proxy Ports
+## 任务 1：固定内置代理端口
 
-**Files:**
-- Modify: `src/clash.rs`
-- Modify: `src/lib.rs`
+**文件：**
 
-**Steps:**
-1. Write tests proving internal proxy startup settings use `mixed_port` and `controller_port`, and reject equal ports.
-2. Run the focused tests and verify they fail before implementation.
-3. Replace random runtime port allocation with configured settings ports.
-4. Run the focused tests and full Rust tests.
+- 修改：`src/clash.rs`
+- 修改：`src/lib.rs`
 
-### Task 2: Non-Fatal Internal Clash Startup
+**步骤：**
 
-**Files:**
-- Modify: `src/main.rs`
+1. 增加测试，证明 `mixed_port` 和 `controller_port` 来自设置。
+2. 增加测试，拒绝两个端口相同。
+3. 将随机端口改为优先使用配置端口。
+4. 运行定向测试和完整测试。
 
-**Steps:**
-1. Add app runtime state fields for `runtime_error` and `last_health`.
-2. Start internal Clash through a non-fatal helper that returns an error string instead of aborting the app.
-3. Include runtime errors in proxy state payloads so UI can show actionable status.
-4. Verify with tests or string-level assertions where direct process startup is not practical.
+## 任务 2：内置代理启动失败不致命
 
-### Task 3: Watchdog Lock Contention Reduction
+**文件：**
 
-**Files:**
-- Modify: `src/main.rs`
+- 修改：`src/main.rs`
 
-**Steps:**
-1. Add a helper that snapshots the current controller without performing network work while holding the global mutex.
-2. Move controller health checks outside the lock.
-3. Reacquire the lock only when a restart is needed.
-4. Run tests and clippy.
+**步骤：**
 
-### Task 4: Efficient Status and Node UI
+1. 在运行态增加 `runtime_error` 和 `last_health`。
+2. 启动内置代理时返回错误字符串，不直接让进程退出。
+3. 在代理状态 IPC 中暴露错误信息。
+4. 用测试或字符串断言验证 UI 能展示错误。
 
-**Files:**
-- Modify: `src/main.rs`
+## 任务 3：降低锁竞争
 
-**Steps:**
-1. Add tests checking the injected script includes a floating status chip, quick node area, fastest-node action, cancellation action, and connectivity check action.
-2. Implement a compact right-bottom status chip beside the settings button.
-3. Add quick node buttons for the latest best five measured nodes.
-4. Replace all-at-once backend testing in the UI with incremental per-node testing using concurrency limits and cancellation.
-5. Add a fastest-node action that tests nodes and switches to the lowest delay node.
-6. Add a ChatGPT connectivity check using the selected internal node.
+**文件：**
 
-### Task 5: Verification and Packaging
+- 修改：`src/main.rs`
 
-**Files:**
-- Modify: `scripts/package-portable.ps1` only if packaging fails.
+**步骤：**
 
-**Steps:**
-1. Run injected JavaScript syntax check.
-2. Run `cargo fmt --check`.
-3. Run `cargo test`.
-4. Run `cargo clippy --all-targets -- -D warnings`.
-5. Package to `target_v04_efficiency`.
-6. Confirm the EXE and bundled `resources/clash/mihomo.exe` exist.
+1. 查找主线程持锁执行网络请求的路径。
+2. 将慢操作移动到后台线程。
+3. UI 只接收最终状态和增量事件。
+4. 运行 `cargo test`。
+
+## 任务 4：节点与状态控制优化
+
+**文件：**
+
+- 修改：`src/main.rs`
+
+**步骤：**
+
+1. 设置面板中显示当前订阅、策略组、节点和延时。
+2. 节点测速分批执行，避免一次性请求过多。
+3. 保存节点选择，下次启动恢复。
+4. 手动验证切换节点后 ChatGPT 仍能访问。
+
+## 验证
+
+```powershell
+cargo fmt --check
+cargo test
+cargo clippy --all-targets -- -D warnings
+```

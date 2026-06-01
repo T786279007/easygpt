@@ -1,17 +1,17 @@
-#define MyAppName "ChatGPT Webview Client"
-#define MyAppPublisher "ChatGPT Webview Client"
-#define MyAppExeName "ChatGPTWebviewClient.exe"
+#define MyAppName "EasyGPT"
+#define MyAppPublisher "EasyGPT"
+#define MyAppExeName "EasyGPT.exe"
 #define MyAppVersion GetEnv("APP_VERSION")
 #if MyAppVersion == ""
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.1.1"
 #endif
 #define SourceDir GetEnv("PACKAGE_SOURCE_DIR")
 #if SourceDir == ""
-#define SourceDir "..\target_v08_top_multipage\portable\ChatGPTWebviewClient"
+#define SourceDir "..\target_installer\installer_staging\portable\EasyGPT"
 #endif
 #define OutputDir GetEnv("INSTALLER_OUTPUT_DIR")
 #if OutputDir == ""
-#define OutputDir "..\target_v08_top_multipage\installer"
+#define OutputDir "..\target_installer\installer"
 #endif
 
 [Setup]
@@ -19,11 +19,11 @@ AppId={{A7986F43-C060-4BD7-82B5-BE8E582FD409}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
-DefaultDirName={localappdata}\Programs\ChatGPTWebviewClient
+DefaultDirName={localappdata}\Programs\EasyGPT
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir={#OutputDir}
-OutputBaseFilename=ChatGPTWebviewClient-Setup-{#MyAppVersion}
+OutputBaseFilename=EasyGPT-windows-x64-Setup-{#MyAppVersion}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern

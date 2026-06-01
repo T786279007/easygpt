@@ -1,59 +1,59 @@
-# v0.9 Performance And Memory Implementation Plan
+# v0.9 性能与内存优化实施计划
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **给 Claude/Codex：** 性能改动必须可验证，不用感觉判断。
 
-**Goal:** Reduce perceived stutter and memory usage by letting users close secondary AI pages and trigger explicit memory optimization without losing the primary ChatGPT session.
+**目标：** 减少卡顿和内存占用，让用户可以关闭次要 AI 页面，并手动触发内存优化，同时保留主 ChatGPT 会话。
 
-**Architecture:** Keep ChatGPT as the protected primary WebView. Secondary pages remain lazy-created, but can be dropped on close or during memory optimization. Hidden remaining WebViews are marked low-memory on Windows WebView2; active WebView remains normal.
+**架构：** ChatGPT 是受保护主 WebView。其他页面懒加载，可关闭或在内存优化时释放。Windows 下隐藏 WebView 设置为低内存级别，活跃 WebView 保持正常级别。
 
-**Tech Stack:** Rust, Tao, Wry/WebView2, vanilla top-shell JavaScript, existing injected settings panel JavaScript.
+**技术栈：** Rust、Tao、Wry/WebView、顶部 shell JavaScript、设置面板 JavaScript。
 
 ---
 
-### Task 1: Shell Commands And Tests
+## 任务 1：shell 命令与测试
 
-**Files:**
-- Modify: `src/main.rs`
+**文件：**
 
-**Steps:**
-1. Add failing tests for `closeSite` and `optimizeMemory` shell command parsing.
-2. Add failing tests that the top shell renders close buttons for non-ChatGPT tabs and a memory optimization toolbar action.
-3. Implement `ShellCommand::CloseSite` and `ShellCommand::OptimizeMemory`.
-4. Verify targeted tests pass.
+- 修改：`src/main.rs`
 
-### Task 2: WebView Lifecycle And Memory Policy
+**步骤：**
 
-**Files:**
-- Modify: `src/main.rs`
+1. 增加 `closeSite` 和 `optimizeMemory` 命令解析测试。
+2. 增加顶部栏关闭按钮和内存清理按钮渲染测试。
+3. 实现 `ShellCommand::CloseSite` 和 `ShellCommand::OptimizeMemory`。
+4. 运行定向测试。
 
-**Steps:**
-1. Add tests for pure helper `releasable_sites_for_memory()`.
-2. Implement helpers to close a secondary content WebView, optimize background pages, sync top-shell tab state, and set WebView2 memory target levels on Windows.
-3. Wire shell close/optimize commands on the UI thread.
-4. Ensure switching pages sets active WebView to normal memory and hidden WebViews to low memory.
+## 任务 2：WebView 生命周期与内存策略
 
-### Task 3: Settings Panel Memory Button
+**文件：**
 
-**Files:**
-- Modify: `src/main.rs`
+- 修改：`src/main.rs`
 
-**Steps:**
-1. Add failing test that settings panel exposes a memory optimization action.
-2. Add `清理内存` button to the settings panel.
-3. Intercept `optimizeMemory` IPC on the UI thread so content pages can trigger WebView cleanup.
-4. Return a compact payload showing how many background pages were released.
+**步骤：**
 
-### Task 4: Verification
+1. 增加可释放站点辅助函数测试。
+2. 实现关闭次要 WebView 的逻辑。
+3. 实现后台页面低内存策略。
+4. 切换页面时恢复活跃页面正常内存级别。
+5. 手动观察切换和关闭后内存变化。
 
-**Commands:**
-- `cargo fmt --check`
-- `cargo test`
-- `cargo clippy --all-targets -- -D warnings`
-- `powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-portable.ps1 -TargetDir target_v08_top_multipage -PackageName ChatGPTWebviewClient`
+## 任务 3：设置面板内存按钮
 
-**Runtime Checks:**
-- Launch the packaged EXE.
-- Switch through all top tabs.
-- Click close buttons for secondary tabs.
-- Click memory optimization.
-- Confirm the app stays alive, ChatGPT remains active, proxy still reaches `chatgpt.com`, and no bundled `mihomo.exe` remains after close.
+**文件：**
+
+- 修改：`src/main.rs`
+
+**步骤：**
+
+1. 设置面板增加清理内存入口。
+2. 点击后触发后台页面释放和 WebView GC 请求。
+3. 展示操作结果。
+
+## 验证
+
+```powershell
+cargo fmt --check
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+```

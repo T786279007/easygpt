@@ -1,19 +1,18 @@
-Third-Party Notices
-===================
+第三方软件声明
+==============
 
-This package bundles third-party software.
+本发布包会随平台内置第三方软件。
 
-Mihomo
+mihomo
 ------
 
-Component: mihomo
-Version: v1.19.25
-Source: https://github.com/MetaCubeX/mihomo
-Bundled file: resources/clash/mihomo.exe
+组件：mihomo
+来源：https://github.com/MetaCubeX/mihomo
+Windows 文件：resources/clash/mihomo.exe
+macOS/Linux 文件：resources/clash/mihomo
 
-Mihomo is distributed by the MetaCubeX project. Review the upstream
-repository for its current license terms, source code, and notices before
-redistributing this client.
+mihomo 由 MetaCubeX 项目分发。重新分发本客户端前，请以 mihomo
+上游仓库的当前许可证、源码和声明为准。
 
-This client launches mihomo as a local sidecar process and uses it only for
-the embedded WebView2 instance. It does not modify the Windows system proxy.
+EasyGPT 会把 mihomo 作为本地 sidecar 进程启动，只供内置 WebView
+访问代理使用。程序不会开启系统全局代理，也不会修改其他应用的代理设置。

@@ -1,217 +1,283 @@
 # EasyGPT
 
-EasyGPT is a lightweight Windows desktop client for ChatGPT and related AI
-sites, built with Rust, Tao, Wry, and Microsoft Edge WebView2.
+EasyGPT 是一个轻量级 AI 网页桌面客户端，基于 Rust、Tao、Wry 和系统 WebView 构建。它可以在一个桌面窗口中打开 ChatGPT、Gemini、NotebookLM 和 Google AI Studio，并支持应用内置的 mihomo/Clash 代理。
 
-It opens the AI pages in a native single-window shell, keeps WebView2 login
-state in a portable local `data` directory, and can run an app-local
-Clash/mihomo proxy without changing the system proxy for other applications.
+## 功能特性
 
-## Features
+- 顶部工具栏支持 ChatGPT、Gemini、NotebookLM、Google AI Studio 多页面切换。
+- 登录态保存在本地 `data/WebView2Profile`，下次启动尽量免重新登录。
+- 应用设置保存在 `data/settings.toml`。
+- 支持直连、系统代理、手动代理、内置 mihomo 代理。
+- 支持多个订阅链接、主动订阅选择、节点列表、节点切换和延时测试。
+- 启动页显示内置代理启动进度和失败诊断。
+- 下载中心记录历史下载，支持打开文件、打开目录、删除记录和清空已完成。
+- 下载保存目录可配置，默认是 `data/Downloads`。
+- 支持导出当前页面为 Markdown 或 PDF。
+- 提供内存清理按钮和后台页面低内存策略。
+- GitHub Actions 可自动构建 Windows、macOS、Linux 发布包。
 
-- Top toolbar for ChatGPT, Gemini, NotebookLM, and Google AI Studio.
-- Long-lived WebView2 profile under `data/WebView2Profile`.
-- App-local settings under `data/settings.toml`.
-- Built-in mihomo proxy mode with multiple subscription URLs.
-- Node/group selection, node delay tests, and saved proxy selection.
-- Startup progress and proxy failure diagnostics.
-- Browser-like download manager with persistent `data/downloads.json`.
-- Configurable download save path, defaulting to `data/Downloads`.
-- Markdown export and WebView2 native PDF export for the active page.
-- Memory cleanup control and background WebView memory-reduction hooks.
-- Portable package and standard Windows installer scripts.
-- GitHub Actions workflow for Windows build artifacts and tagged releases.
+## 系统要求
 
-## Requirements
+### Windows
 
-- Windows 10/11.
-- Microsoft Edge WebView2 Runtime.
-- Rust stable with the MSVC toolchain.
-- Inno Setup 6 only when building the installer locally.
+- Windows 10/11。
+- Microsoft Edge WebView2 Runtime。
+- 发布包内置 `resources/clash/mihomo.exe`。
 
-The packaging scripts download `resources/clash/mihomo.exe` automatically when
-it is missing. The downloaded binary is intentionally ignored by Git.
+### macOS
 
-## Run From Source
+- macOS 12 或更新版本。
+- 使用系统 WKWebView。
+- 发布包内置 `resources/clash/mihomo`。
+
+### Linux
+
+- 需要 GTK/WebKitGTK 运行环境。
+- Ubuntu/Debian 可安装：
+
+```bash
+sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0 libxdo3
+```
+
+开发或 GitHub Actions 构建时需要：
+
+```bash
+sudo apt install libwebkit2gtk-4.1-dev libgtk-3-dev libxdo-dev pkg-config
+```
+
+Linux WebView/Wry/Tauri 同类栈通常依赖 WebKitGTK，Debian/Ubuntu 开发包为 `libwebkit2gtk-4.1-dev`。
+
+## 本地运行
 
 ```powershell
 cargo run
 ```
 
-## Build EXE
+## 构建 EXE
 
 ```powershell
 cargo build --release
 ```
 
-The release executable is created at:
+Windows release 文件位于：
 
 ```text
 target\release\chatgpt_webview_client.exe
 ```
 
-For local source-tree runs, the app can find `resources\clash\mihomo.exe` from
-the project root even when the EXE is under `target\debug` or `target\release`.
-
-## Portable Package
+## Windows 便携包
 
 ```powershell
 .\scripts\package-portable.ps1 -TargetDir target_portable
 ```
 
-The portable package is created at:
+输出目录：
 
 ```text
-target_portable\portable\ChatGPTWebviewClient
+target_portable\portable\EasyGPT
 ```
 
-Copy this whole folder to another Windows computer to run the app without a
-separate installation step.
+复制整个目录到其他 Windows 电脑即可运行。
 
-## Windows Installer
+## Windows 安装包
 
 ```powershell
 .\scripts\package-installer.ps1 -TargetDir target_installer
 ```
 
-The installer is created at:
+输出文件：
 
 ```text
-target_installer\installer\ChatGPTWebviewClient-Setup-0.1.0.exe
+target_installer\installer\EasyGPT-windows-x64-Setup-0.1.1.exe
 ```
 
-If Inno Setup 6 is not installed, the script still prepares the portable source
-folder and prints the installer script path.
-
-The installer uses a per-user directory:
+安装目录默认是：
 
 ```text
-%LOCALAPPDATA%\Programs\ChatGPTWebviewClient
+%LOCALAPPDATA%\Programs\EasyGPT
 ```
 
-Use `-IncludeCurrentData` only when you intentionally want to package the
-current local `data` directory into the installer source.
+如需把当前 `data` 目录打进安装源，可添加 `-IncludeCurrentData`。不要在公开发布包中包含个人登录态、订阅链接或 Cookie。
 
-## Data And Login State
+## macOS 发布包
 
-Runtime data is stored next to the EXE:
+```bash
+bash scripts/package-macos.sh --target-dir target_macos --arch arm64
+bash scripts/package-macos.sh --target-dir target_macos --arch x64
+```
+
+输出文件：
 
 ```text
-data\
-  WebView2Profile\
+target_macos/artifacts/EasyGPT-macos-arm64.dmg
+target_macos/artifacts/EasyGPT-macos-arm64-app.tar.gz
+target_macos/artifacts/EasyGPT-macos-x64.dmg
+target_macos/artifacts/EasyGPT-macos-x64-app.tar.gz
+```
+
+macOS `.app` 包通过启动脚本把数据目录设置到：
+
+```text
+~/Library/Application Support/EasyGPT/data
+```
+
+## Linux 发布包
+
+```bash
+bash scripts/package-linux.sh --target-dir target_linux --arch x64
+```
+
+输出文件：
+
+```text
+target_linux/artifacts/EasyGPT-linux-x64.deb
+target_linux/artifacts/EasyGPT-linux-x64-portable.tar.gz
+```
+
+`.deb` 安装后通过 `easygpt` 命令启动，数据目录默认是：
+
+```text
+~/.local/share/EasyGPT/data
+```
+
+便携包默认把数据保存在程序目录旁边的 `data`。
+
+## 数据与登录态
+
+运行数据默认保存在程序旁边：
+
+```text
+data/
+  WebView2Profile/
   settings.toml
   downloads.json
-  Downloads\
-  clash\
+  Downloads/
+  clash/
 ```
 
-After signing in once, reopening the same portable folder should keep the
-session unless the site invalidates it. Copying the portable folder copies the
-profile too, but ChatGPT and Google services can still request verification
-because their cookies may depend on device, browser, IP, or OS state.
+安装型 macOS/Linux 包会通过 `EASYGPT_DATA_DIR` 把数据目录放到用户可写位置。也可以手动设置：
 
-Do not commit or publish the `data` directory. It may contain login state,
-subscription URLs, proxy config, logs, downloads, and other machine-specific
-files.
+```bash
+export EASYGPT_DATA_DIR="$HOME/.local/share/EasyGPT/data"
+```
 
-## Proxy
+登录态能否跨设备完全复用取决于目标网站。ChatGPT 和 Google 服务可能会因为设备、IP、系统密钥、浏览器指纹变化而要求重新验证。
 
-Proxy modes:
+不要提交或公开发布 `data` 目录。它可能包含 Cookie、LocalStorage、订阅地址、代理配置、日志和下载文件。
 
-- `direct`: no proxy.
-- `system`: use the Windows user proxy setting for this WebView2 instance.
-- `manual`: use the proxy configured by environment/settings.
-- `internal_clash`: start bundled mihomo and point only this app at it.
+## 代理功能
 
-When `internal_clash` is enabled, EasyGPT writes sanitized mihomo runtime files
-under:
+代理模式：
+
+- `direct`：直连。
+- `system`：读取系统代理。
+- `manual`：使用手动代理。
+- `internal_clash`：启动内置 mihomo，并且只让本应用走代理。
+
+内置代理运行文件位于：
 
 ```text
-data\clash\
+data/clash/
 ```
 
-The built-in proxy is app-local. It does not enable the Windows global proxy and
-should not affect other applications.
+程序不会开启系统全局代理，也不会影响其他应用。设置界面支持：
 
-The settings UI supports:
+- 添加多个订阅链接。
+- 选择当前订阅。
+- 刷新订阅和 mihomo 配置。
+- 查看策略组和节点。
+- 切换节点。
+- 测试节点延时。
+- 保存已选策略组和节点。
+- 查看最近 mihomo 日志。
 
-- multiple subscription links;
-- selecting the active subscription;
-- refreshing subscription/config;
-- listing proxy groups and nodes;
-- switching nodes;
-- testing node latency;
-- saving the selected group and node for the next launch;
-- viewing recent mihomo log lines.
+## 下载中心
 
-## Downloads
+顶部下载按钮会打开下载中心。下载中心支持：
 
-The top toolbar download button opens the download manager. The manager shows
-recent downloads, supports search, opens files/folders, deletes records, clears
-completed records, and links to download save-path settings.
+- 查看历史下载。
+- 搜索文件名、路径、地址或状态。
+- 打开文件。
+- 打开所在目录。
+- 删除单条记录。
+- 清空已完成记录。
+- 跳转下载路径设置。
 
-Download history is stored at:
+下载历史保存在：
 
 ```text
-data\downloads.json
+data/downloads.json
 ```
 
-The default save location is:
+默认下载目录：
 
 ```text
-data\Downloads
+data/Downloads
 ```
 
-## Export
+## 导出
 
-The toolbar export menu supports:
+顶部工具栏支持：
 
-- Markdown export through visible conversation extraction.
-- PDF export through WebView2 native `PrintToPdf` on Windows, with a fallback
-  record if the native path fails.
+- 导出 Markdown：提取当前页面可见对话文本。
+- 导出 PDF：Windows 优先使用 WebView2 `PrintToPdf`；其他平台使用内置 PDF 回退导出。
 
-Exported files are written through the same download destination resolver used
-by normal downloads.
+导出文件会走同一套下载路径规则，并写入下载中心记录。
 
-## GitHub Actions
+## GitHub Release
 
-The workflow at `.github/workflows/build-windows.yml` runs on pushes, pull
-requests, manual dispatch, and `v*` tags. It performs:
+工作流文件：
 
 ```text
-cargo fmt --check
-cargo test
-cargo clippy --all-targets -- -D warnings
-.\scripts\package-installer.ps1 -TargetDir target_ci
+.github/workflows/build-windows.yml
 ```
 
-Artifacts include a portable zip and installer. Tagged builds also publish a
-GitHub Release.
+推送到 `main` 或发起 PR 时会构建验证。推送 `v*` 标签时会发布 Release。
 
-## Diagnostics
+发布命令示例：
 
-For WebView2 Chrome DevTools Protocol debugging:
+```bash
+git tag v0.1.1
+git push origin v0.1.1
+```
+
+Release 产物包括：
+
+- `EasyGPT-windows-x64-Setup-*.exe`
+- `EasyGPT-windows-x64-portable.zip`
+- `EasyGPT-macos-arm64.dmg`
+- `EasyGPT-macos-arm64-app.tar.gz`
+- `EasyGPT-macos-x64.dmg`
+- `EasyGPT-macos-x64-app.tar.gz`
+- `EasyGPT-linux-x64.deb`
+- `EasyGPT-linux-x64-portable.tar.gz`
+- `SHA256SUMS.txt`
+
+GitHub 官方 runner 说明中，`macos-15` 是 arm64，`macos-15-intel` 是 Intel；本项目据此分别构建 macOS Apple Silicon 与 Intel 包。
+
+## 诊断
+
+Windows WebView2 可开启 Chrome DevTools Protocol：
 
 ```powershell
 $env:CHATGPT_CLIENT_REMOTE_DEBUG_PORT = "9223"
 cargo run
 ```
 
-Then open:
+然后打开：
 
 ```text
 http://127.0.0.1:9223/json/list
 ```
 
-Local CDP lists and debug logs such as `cdp-list.json` and `debug-*.log` are
-ignored by Git.
+本地调试文件如 `cdp-list.json` 和 `debug-*.log` 已加入忽略规则。
 
-## Repository Hygiene
+## 仓库卫生
 
-Tracked source files are enough to build and package the app. These files are
-intentionally not tracked:
+以下内容不会进入 Git：
 
-- `target*` build outputs.
-- `data` runtime state.
-- `resources/clash/mihomo.exe`.
-- temporary subscription servers and local debug logs.
+- `target*` 构建输出。
+- `data` 运行数据。
+- `resources/clash/mihomo.exe`。
+- `resources/clash/mihomo`。
+- 临时订阅服务和本地调试日志。

@@ -24,7 +24,10 @@ use crate::{
 };
 
 const CLASH_DIR_NAME: &str = "clash";
-const MIHOMO_EXE_NAME: &str = "mihomo.exe";
+#[cfg(windows)]
+const MIHOMO_FILE_NAME: &str = "mihomo.exe";
+#[cfg(not(windows))]
+const MIHOMO_FILE_NAME: &str = "mihomo";
 const SUBSCRIPTION_USER_AGENTS: &[&str] = &["clash.meta", "clash"];
 
 #[cfg(windows)]
@@ -392,7 +395,7 @@ fn bundled_mihomo_path() -> Result<PathBuf> {
             current_dir
                 .join("resources")
                 .join(CLASH_DIR_NAME)
-                .join(MIHOMO_EXE_NAME),
+                .join(MIHOMO_FILE_NAME),
         );
     }
 
@@ -403,7 +406,7 @@ fn bundled_mihomo_path() -> Result<PathBuf> {
     }
 
     bail!(
-        "could not find bundled mihomo.exe. Checked: {}",
+        "could not find bundled mihomo. Checked: {}",
         candidates
             .iter()
             .map(|path| path.display().to_string())
@@ -416,10 +419,22 @@ fn bundled_mihomo_path_candidates_from_exe_dir(exe_dir: &Path) -> Vec<PathBuf> {
     let sidecar = |base: &Path| {
         base.join("resources")
             .join(CLASH_DIR_NAME)
-            .join(MIHOMO_EXE_NAME)
+            .join(MIHOMO_FILE_NAME)
     };
 
     let mut candidates = vec![sidecar(exe_dir)];
+
+    if let Some(contents_dir) = exe_dir
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "Contents"))
+    {
+        candidates.push(
+            contents_dir
+                .join("Resources")
+                .join(CLASH_DIR_NAME)
+                .join(MIHOMO_FILE_NAME),
+        );
+    }
 
     if is_cargo_profile_dir(exe_dir)
         && let Some(project_dir) = exe_dir.parent().and_then(|target_dir| target_dir.parent())
@@ -1412,11 +1427,27 @@ rules:
 
         assert!(rendered.iter().any(|path| {
             path.ends_with("chatgpt_webview_client/target/release/resources/clash/mihomo.exe")
+                || path.ends_with("chatgpt_webview_client/target/release/resources/clash/mihomo")
         }));
+        assert!(rendered.iter().any(|path| {
+            path.ends_with("chatgpt_webview_client/resources/clash/mihomo.exe")
+                || path.ends_with("chatgpt_webview_client/resources/clash/mihomo")
+        }));
+    }
+
+    #[test]
+    fn mihomo_path_candidates_include_macos_app_resources() {
+        let exe_dir = PathBuf::from("/Applications/EasyGPT.app/Contents/MacOS");
+        let candidates = bundled_mihomo_path_candidates_from_exe_dir(&exe_dir);
+        let rendered = candidates
+            .iter()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect::<Vec<_>>();
+
         assert!(
             rendered
                 .iter()
-                .any(|path| path.ends_with("chatgpt_webview_client/resources/clash/mihomo.exe"))
+                .any(|path| path.contains("EasyGPT.app/Contents/Resources/clash/"))
         );
     }
 }

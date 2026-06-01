@@ -1,74 +1,88 @@
-# v0.4 Download Manager, Latency, and PDF Export Implementation Plan
+# v0.4 下载中心、延时检测与 PDF 导出实施计划
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **给 Claude/Codex：** 按任务逐项实现，并在每项后运行对应测试。
 
-**Goal:** Add visible page latency, a usable download manager, and rendered-page PDF export.
+**目标：** 增加可见页面延时、可用下载中心和当前页面 PDF 导出。
 
-**Architecture:** The top shell remains the control surface. Rust owns file system operations, download history, WebView2 native download callbacks, and WebView2 PDF printing. Content WebViews only provide browser-context signals via IPC and scripts.
+**架构：** 顶部 shell 是控制面。Rust 负责文件系统、下载历史、WebView 原生下载回调和 PDF 输出。内容 WebView 只负责提供当前页面上下文和脚本结果。
 
-**Tech Stack:** Rust, Tao, Wry/WebView2, in-memory runtime state, existing unit tests.
+**技术栈：** Rust、Tao、Wry/WebView、内存运行态、serde、现有单元测试。
 
 ---
 
-### Task 1: Shell UI Contract Tests
+## 任务 1：shell UI 契约测试
 
-**Files:**
-- Modify: `src/main.rs`
+**文件：**
 
-**Steps:**
-- Add tests asserting the top shell contains a latency pill, download manager button, download panel, `measureLatency`, and `openDownloadPath`.
-- Run targeted tests and verify they fail before implementation.
+- 修改：`src/main.rs`
 
-### Task 2: Download Model Tests
+**步骤：**
 
-**Files:**
-- Modify: `src/main.rs`
+1. 增加测试，断言顶部栏包含延时状态、下载按钮、下载中心入口、`measureLatency`、`openDownloadPath`。
+2. 先运行测试，确认缺功能时失败。
+3. 实现最小 UI。
+4. 重新运行定向测试。
 
-**Steps:**
-- Add `DownloadRecord` tests for started/completed/failed/manual save events.
-- Add tests for JSON payload sent to shell.
-- Run targeted tests and verify they fail before implementation.
+## 任务 2：下载模型测试
 
-### Task 3: Implement Download Manager
+**文件：**
 
-**Files:**
-- Modify: `src/main.rs`
+- 修改：`src/main.rs`
 
-**Steps:**
-- Add `DownloadRecord`, `DownloadStatus`, and app-level `DownloadStore`.
-- Convert `DownloadEvent` into records.
-- Add shell APIs: show list, open file/location, clear completed.
-- Update native and client-side download paths to emit records.
+**步骤：**
 
-### Task 4: Implement Latency
+1. 增加 `DownloadRecord` 测试，覆盖开始、完成、失败、诊断事件。
+2. 增加 shell 下载 payload 测试。
+3. 实现 `DownloadRecord`、`DownloadStatus` 和下载历史容器。
+4. 运行测试。
 
-**Files:**
-- Modify: `src/main.rs`
+## 任务 3：实现下载中心
 
-**Steps:**
-- Add `measureLatency` shell command and `LatencyEvent`.
-- Inject a content WebView script that fetches the active site URL with cache-busting and timeout.
-- Update shell UI on success/failure and run every 60 seconds.
+**文件：**
 
-### Task 5: Implement Native PDF Export
+- 修改：`src/main.rs`
 
-**Files:**
-- Modify: `src/main.rs`
-- Possibly modify: `Cargo.toml`
+**步骤：**
 
-**Steps:**
-- Add `ExportConversation(Pdf)` branch that calls WebView2 native `PrintToPdf` on Windows.
-- Save into the normal download destination with a unique filename.
-- On failure, use existing text PDF fallback and record the result.
+1. 将 `DownloadEvent` 写入下载记录。
+2. 增加 shell API：打开下载中心、打开文件、打开目录、清空已完成、删除记录。
+3. 原生下载和 blob/data 下载统一写入下载历史。
+4. 同步 shell 和下载管理窗口状态。
 
-### Task 6: Verify and Package
+## 任务 4：实现延时检测
 
-**Files:**
-- No new desktop output; use project-local `target_v04_download_latency_export`.
+**文件：**
 
-**Commands:**
-- `cargo fmt --check`
-- `cargo test`
-- `cargo clippy --all-targets -- -D warnings`
-- `CARGO_TARGET_DIR=target_v04_download_latency_export cargo build --release`
-- `powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/package-installer.ps1 -TargetDir target_v04_download_latency_export`
+- 修改：`src/main.rs`
+
+**步骤：**
+
+1. 增加 `measureLatency` shell 命令和 `LatencyEvent`。
+2. 向当前内容 WebView 注入 fetch 测速脚本。
+3. 成功或失败都回传 shell。
+4. 设置 60 秒定时检测。
+
+## 任务 5：实现 PDF 导出
+
+**文件：**
+
+- 修改：`src/main.rs`
+- 可能修改：`Cargo.toml`
+
+**步骤：**
+
+1. 增加 `ExportConversation(Pdf)` 分支。
+2. Windows 调用 WebView2 `PrintToPdf`。
+3. 其他平台使用内置 PDF 回退。
+4. 文件写入统一下载目录。
+5. 写入下载历史。
+
+## 任务 6：验证与打包
+
+```powershell
+cargo fmt --check
+cargo test
+cargo clippy --all-targets -- -D warnings
+CARGO_TARGET_DIR=target_v04_download_latency_export cargo build --release
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./scripts/package-installer.ps1 -TargetDir target_v04_download_latency_export
+```

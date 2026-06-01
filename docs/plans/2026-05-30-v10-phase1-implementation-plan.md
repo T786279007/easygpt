@@ -1,297 +1,115 @@
-# EasyGPT v0.10/v0.11 Phase 1 Implementation Plan
+# EasyGPT v0.10/v0.11 第一阶段实施计划
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to execute this plan task-by-task.
+> **给 Claude/Codex：** 这是阶段性实施计划，优先保证启动可靠和下载中心可用。
 
-**Goal:** Implement the first releasable slice of the v1.0 roadmap: reliable startup/proxy progress plus a persistent browser-like download center with configurable save location.
+**目标：** 交付 v1.0 路线中的第一批可发布能力：可靠启动/代理进度，以及持久化下载中心和可配置保存位置。
 
-**Architecture:** Keep the existing Rust/Tao/Wry single-window architecture. Add small pure-data helpers for startup progress and downloads, then integrate them into `src/main.rs` shell IPC and WebView2 download callbacks. Keep slow proxy, filesystem, and controller operations off the UI thread.
+**架构：** 保持现有 Rust/Tao/Wry 单窗口结构。新增小型纯数据模型管理启动进度和下载历史，再接入 `src/main.rs` 的 shell IPC 和 WebView 下载回调。代理、文件系统和 Controller 慢操作不得阻塞 UI 线程。
 
-**Tech Stack:** Rust 2024, Tao, Wry/WebView2, serde/toml/json, mihomo Controller API, vanilla shell HTML/JS.
+**技术栈：** Rust 2024、Tao、Wry/WebView、serde/toml/json、mihomo Controller API、原生 HTML/JS。
 
 ---
 
-## Scope
-
-Implement in this phase:
+## 范围
 
-- Startup/proxy progress state model and waiting-page UI states.
-- RuntimeReady navigation fallback so the waiting page cannot remain stuck indefinitely.
-- Download settings under `[downloads]`.
-- Configurable download destination with `data/Downloads` default and safe fallback.
-- Persistent `data/downloads.json`.
-- Centered download manager UI matching the browser-style reference.
-- Tests, clippy, release build, and package verification.
+本阶段实现：
 
-Do not implement in this phase:
+- 启动/代理进度状态模型。
+- 等待页阶段状态展示。
+- `RuntimeReady` 导航兜底，避免一直卡在等待页。
+- `[downloads]` 设置。
+- 下载保存目录配置。
+- 默认 `data/Downloads`。
+- 持久化 `data/downloads.json`。
+- 居中浏览器式下载中心。
+- 测试、clippy、release 构建和安装包验证。
 
-- Long screenshot PDF.
-- Automatic update.
-- Full portable data import/export.
-- Complex multi-thread/continued downloads.
-- Tray mode.
+本阶段不实现：
 
-## Task 1: Download Settings Model
-
-**Files:**
-
-- Modify: `src/lib.rs`
-- Test: `src/lib.rs`
-
-**Steps:**
-
-1. Add failing tests:
-   - `default_download_settings_use_portable_downloads_dir`
-   - `old_settings_without_downloads_deserialize_with_defaults`
-   - `app_settings_round_trip_includes_downloads`
-2. Add:
-   - `DownloadSettings`
-   - `DownloadSaveMode`
-   - defaults: fixed `data/Downloads`, empty `last_dir`, `ask_each_time = false`, `max_records = 500`
-3. Add `downloads: DownloadSettings` to `AppSettings` with `#[serde(default)]`.
-4. Update normalization if needed.
-5. Run:
-
-```powershell
-cargo test download_settings app_settings --lib
-```
-
-Expected: all targeted tests pass.
-
-## Task 2: Download Destination Resolver
+- 长截图 PDF。
+- 自动更新。
+- 完整便携数据导入/导出。
+- 复杂多线程断点续传下载。
+- 托盘模式。
 
-**Files:**
-
-- Modify: `src/main.rs`
-- Test: `src/main.rs`
-
-**Steps:**
-
-1. Add failing tests for:
-   - fixed relative directory resolves under `data/Downloads`
-   - absolute fixed directory is respected
-   - last directory mode uses `last_dir`
-   - invalid/unwritable directory falls back to user downloads `EasyGPT`
-   - duplicate filenames get counters
-2. Replace `download_destination_for(path)` with a version that accepts download settings or app settings snapshot.
-3. Update WebView2 native download handler, blob/data `saveDownload` handler, native self-test, and exports to use the resolver.
-4. Ensure successful downloads update `last_dir` when save mode is last-dir.
-5. Run targeted tests:
-
-```powershell
-cargo test download_destination unique_download_path save_download_payload --bin chatgpt_webview_client
-```
-
-Expected: targeted tests pass.
+## 任务 1：下载设置模型
 
-## Task 3: Persistent Download History
+**文件：**
 
-**Files:**
+- 修改：`src/lib.rs`
+- 测试：`src/lib.rs`
 
-- Modify: `src/main.rs`
-- Test: `src/main.rs`
-
-**Steps:**
-
-1. Add failing tests:
-   - missing `downloads.json` loads empty history
-   - corrupt JSON loads empty history and does not panic
-   - record/save/load round trip preserves completed record
-   - max records defaults to 500 and trims oldest completed records
-   - started records from previous session become failed/cancelled on load
-2. Add `download_history_path()` under `data/downloads.json`.
-3. Add serializable store structs:
-   - `DownloadHistoryStore`
-   - `PersistedDownloadRecord`
-4. Add load/save helpers with temp-file then rename for atomic save.
-5. Replace `DownloadHistory::default()` startup with `load_download_history(settings.downloads.max_records)`.
-6. Save after every record mutation and after clear/delete.
-7. Run:
-
-```powershell
-cargo test download_history download_record --bin chatgpt_webview_client
-```
-
-Expected: targeted tests pass.
-
-## Task 4: Download Center Shell UI
+**步骤：**
 
-**Files:**
+1. 增加默认下载设置测试。
+2. 增加旧配置缺少 `[downloads]` 时的兼容测试。
+3. 增加设置 TOML 往返测试。
+4. 添加 `DownloadSettings`、`DownloadSaveMode`。
+5. 在 `AppSettings` 增加 `downloads` 字段并设置默认值。
+6. 运行 `cargo test download_settings app_settings --lib`。
 
-- Modify: `src/main.rs`
-- Test: `src/main.rs`
-
-**Steps:**
-
-1. Add failing HTML tests:
-   - shell contains centered download manager modal
-   - modal includes clear completed, new download, download settings, search box
-   - rows include open file, open folder, copy path, delete record, retry when possible
-   - old small right-top `.download-panel` is not used as primary layout
-2. Replace shell `.download-panel` with centered `.download-center`.
-3. Keep toast notifications.
-4. Update `renderDownloads()`:
-   - render only when modal open or state changes
-   - search filter by filename/path/source/url
-   - use stable item id
-   - show missing/failed status visibly
-5. Add shell IPC parsing for:
-   - `deleteDownloadRecord`
-   - `retryDownload`
-   - `newDownload`
-   - `saveDownloadSettings`
-6. Run:
+## 任务 2：下载目录解析
 
-```powershell
-cargo test top_shell_html_exposes_download --bin chatgpt_webview_client
-cargo test parse_shell_command_recognizes_download --bin chatgpt_webview_client
-```
+**文件：**
 
-Expected: targeted tests pass.
-
-## Task 5: Download Settings UI
+- 修改：`src/main.rs`
+- 测试：`src/main.rs`
 
-**Files:**
-
-- Modify: `src/main.rs`
-- Test: `src/main.rs`
+**步骤：**
 
-**Steps:**
+1. 增加固定相对目录解析测试。
+2. 增加固定绝对目录解析测试。
+3. 增加最近目录模式测试。
+4. 增加同名文件自动加序号测试。
+5. 替换旧的下载路径函数。
+6. 下载成功后更新 `last_dir`。
 
-1. Add failing tests that the settings panel exposes:
-   - fixed save directory
-   - use last directory
-   - ask each time placeholder/disabled note if not implemented
-   - max records
-   - save and close buttons
-2. Update injected settings panel HTML/JS to include a `下载` section.
-3. Make `saveSettings` include `downloads` payload.
-4. Ensure old settings still render without errors.
-5. Run:
+## 任务 3：下载历史持久化
 
-```powershell
-cargo test settings_script --bin chatgpt_webview_client
-cargo test app_settings_round_trip --lib
-```
+**文件：**
 
-Expected: targeted tests pass.
+- 修改：`src/main.rs`
+- 测试：`src/main.rs`
 
-## Task 6: Startup Progress Model
+**步骤：**
 
-**Files:**
+1. 增加缺少 `downloads.json` 时返回空历史测试。
+2. 增加历史记录上限测试。
+3. 增加启动中断的下载标记失败测试。
+4. 实现 `load_download_history` 和 `save_download_history`。
 
-- Modify: `src/main.rs`
-- Test: `src/main.rs`
+## 任务 4：启动进度与错误页
 
-**Steps:**
+**文件：**
 
-1. Add failing tests for:
-   - `StartupStage` serializes expected user-facing labels
-   - waiting page includes progress placeholders and action buttons
-   - startup progress script updates current step and elapsed seconds
-2. Add `StartupStage` enum and `StartupProgress` struct.
-3. Add `UserEvent::StartupProgress`.
-4. Add `startup_progress_script(progress)`.
-5. Update waiting page HTML with:
-   - current step
-   - elapsed seconds
-   - retry proxy
-   - skip proxy
-   - open settings
-   - view logs
-6. Run:
+- 修改：`src/main.rs`
 
-```powershell
-cargo test startup_stage waiting_page startup_progress --bin chatgpt_webview_client
-```
+**步骤：**
 
-Expected: targeted tests pass.
+1. 定义启动阶段枚举。
+2. 等待页显示当前步骤、已用时间和操作提示。
+3. 代理启动线程分阶段发送事件。
+4. 失败时显示错误页，不让窗口闪退。
 
-## Task 7: RuntimeReady Fallback
+## 任务 5：下载中心 UI
 
-**Files:**
+**文件：**
 
-- Modify: `src/main.rs`
-- Test: `src/main.rs`
+- 修改：`src/main.rs`
 
-**Steps:**
+**步骤：**
 
-1. Add failing tests:
-   - RuntimeReady script navigates waiting pages for every `AiSite`
-   - waiting page includes manual continue button with target URL
-   - RuntimeFailed script replaces waiting page content with error actions
-2. Ensure RuntimeReady fan-out runs against all existing content WebViews.
-3. Ensure future content WebViews open real site when `runtime_ready == true`.
-4. Add waiting page manual continue button.
-5. Add timeout fallback path after 15 seconds if possible without blocking UI.
-6. Run:
+1. 顶部工具栏增加下载按钮。
+2. 打开居中下载中心窗口。
+3. 支持搜索、打开文件、打开目录、删除记录、清空已完成、关闭。
+4. 下载记录变化时同步窗口。
 
-```powershell
-cargo test runtime_ready_script waiting_page runtime_failed --bin chatgpt_webview_client
-```
-
-Expected: targeted tests pass.
-
-## Task 8: Performance Guardrails
-
-**Files:**
-
-- Modify: `src/main.rs`
-- Test: `src/main.rs`
-
-**Steps:**
-
-1. Add helper tests:
-   - UI payload caps at max records
-   - clear completed does not remove active downloads
-   - download manager search is client-side and does not request file content
-2. Add 500-record serialization/render fixture test at pure HTML/data level.
-3. Add comments or helper boundaries ensuring UI thread does not perform large downloads, node tests, or JSON parsing during hot paths where practical.
-4. Keep progress updates batched where possible.
-5. Run:
-
-```powershell
-cargo test download_history_caps_records top_shell_html --bin chatgpt_webview_client
-```
-
-Expected: targeted tests pass.
-
-## Task 9: Documentation
-
-**Files:**
-
-- Modify: `README.md`
-- Modify: `docs/plans/2026-05-30-v10-product-performance-download-center-spec.md` if needed
-
-**Steps:**
-
-1. Document:
-   - default download directory
-   - download history file
-   - startup progress/error page behavior
-   - caveat about portable login state
-2. Run no code tests for documentation-only changes unless code was touched in the same commit.
-
-## Task 10: Final Verification
-
-Run:
+## 任务 6：最终验证
 
 ```powershell
 cargo fmt --check
 cargo test
 cargo clippy --all-targets -- -D warnings
-$env:CARGO_TARGET_DIR='target_v10_phase1'
 cargo build --release
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/package-installer.ps1 -TargetDir target_v10_phase1
 ```
-
-Manual verification:
-
-1. Start packaged EXE and observe at least 30 seconds.
-2. Confirm startup page transitions or shows actionable error within 15 seconds.
-3. Download a small file from ChatGPT or run self-test.
-4. Confirm file lands in configured directory.
-5. Open download center and verify record exists.
-6. Close and reopen app; record still exists.
-7. Open file and folder actions work.
-8. Close app; bundled `mihomo.exe` is gone.
-

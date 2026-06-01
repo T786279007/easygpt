@@ -11,6 +11,7 @@ pub const CHATGPT_URL: &str = "https://chatgpt.com";
 pub const APP_DIR_NAME: &str = "ChatGPTWebviewClient";
 pub const WEBVIEW_PROFILE_DIR_NAME: &str = "WebView2Profile";
 pub const PORTABLE_DATA_DIR_NAME: &str = "data";
+pub const DATA_DIR_ENV_VAR: &str = "EASYGPT_DATA_DIR";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyScheme {
@@ -195,7 +196,21 @@ pub fn app_data_dir() -> Result<PathBuf> {
 }
 
 pub fn portable_data_dir() -> Result<PathBuf> {
-    Ok(executable_dir()?.join(PORTABLE_DATA_DIR_NAME))
+    let configured = std::env::var_os(DATA_DIR_ENV_VAR)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+
+    Ok(portable_data_dir_from_exe_dir(
+        &executable_dir()?,
+        configured,
+    ))
+}
+
+fn portable_data_dir_from_exe_dir(
+    exe_dir: &std::path::Path,
+    configured: Option<PathBuf>,
+) -> PathBuf {
+    configured.unwrap_or_else(|| exe_dir.join(PORTABLE_DATA_DIR_NAME))
 }
 
 fn legacy_app_data_dir() -> Result<PathBuf> {
@@ -482,6 +497,21 @@ mod tests {
         let rendered = path.to_string_lossy().replace('\\', "/");
 
         assert!(rendered.ends_with("data"));
+    }
+
+    #[test]
+    fn portable_data_dir_can_be_overridden_for_system_packages() {
+        let exe_dir = PathBuf::from("/opt/easygpt");
+        let configured = PathBuf::from("/home/user/.local/share/EasyGPT");
+
+        assert_eq!(
+            portable_data_dir_from_exe_dir(&exe_dir, Some(configured.clone())),
+            configured
+        );
+        assert_eq!(
+            portable_data_dir_from_exe_dir(&exe_dir, None),
+            PathBuf::from("/opt/easygpt/data")
+        );
     }
 
     #[test]

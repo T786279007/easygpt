@@ -1,6 +1,7 @@
 param(
     [string]$TargetDir = "target_portable",
-    [string]$PackageName = "ChatGPTWebviewClient"
+    [string]$PackageName = "EasyGPT",
+    [string]$ExeName = "$PackageName.exe"
 )
 
 $ErrorActionPreference = "Stop"
@@ -34,7 +35,7 @@ try {
     New-Item -ItemType Directory -Force -Path (Join-Path $PackageDir "resources\clash") | Out-Null
 
     Copy-Item -LiteralPath (Join-Path $ReleaseDir "chatgpt_webview_client.exe") `
-        -Destination (Join-Path $PackageDir "ChatGPTWebviewClient.exe") -Force
+        -Destination (Join-Path $PackageDir $ExeName) -Force
     Copy-Item -LiteralPath (Join-Path $ProjectRoot "resources\clash\mihomo.exe") `
         -Destination (Join-Path $PackageDir "resources\clash\mihomo.exe") -Force
     Copy-Item -LiteralPath (Join-Path $ProjectRoot "THIRD_PARTY_NOTICES.txt") `

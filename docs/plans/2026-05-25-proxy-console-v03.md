@@ -1,97 +1,65 @@
-# Proxy Console v0.3 Implementation Plan
+# 代理控制台 v0.3 实施计划
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **给 Claude/Codex：** 按任务逐项执行，完成一项验证一项。
 
-**Goal:** Add an in-page proxy console that can list mihomo strategy groups, choose nodes, test latency, refresh subscription/config state, show logs, and persist the selected proxy so ChatGPT and proxy settings are restored on next launch.
+**目标：** 在页面内增加代理控制台，支持查看 mihomo 策略组、选择节点、测试延时、刷新订阅、查看日志，并保存已选节点。
 
-**Architecture:** Keep mihomo as the only proxy engine. Rust owns all mihomo Controller API calls and exposes a narrow IPC surface to the injected settings panel. WebView2 remains pointed only at the app-local mixed proxy, while AppData stores WebView2 login state, app settings, cached subscription, generated config, and mihomo logs.
+**架构：** Rust 负责所有 mihomo Controller API 调用；页面设置面板只通过受控 IPC 发送命令。WebView 只使用本应用的本地 mixed 代理端口，登录态、设置、订阅缓存、生成配置和日志都保存在应用数据目录。
 
-**Tech Stack:** Rust 2024, Wry/WebView2, reqwest blocking client, serde/serde_json/serde_yaml, mihomo Controller REST API, TOML settings in `%LOCALAPPDATA%\ChatGPTWebviewClient`.
+**技术栈：** Rust 2024、Wry/WebView、reqwest、serde/serde_json/serde_yaml、mihomo Controller REST API、TOML 设置。
 
 ---
 
-### Task 1: Add mihomo Controller Client
+## 任务 1：增加 mihomo Controller 客户端
 
-**Files:**
-- Create: `src/controller.rs`
-- Modify: `src/lib.rs`
-- Test: `src/controller.rs`
+**文件：**
 
-**Steps:**
-1. Write failing tests for parsing `/proxies` JSON into groups and nodes.
-2. Write failing tests for URL encoding proxy names containing Chinese, spaces, and `/`.
-3. Implement `ClashController` with `proxy_state`, `test_delay`, `select_proxy`, and `format_proxy_path`.
-4. Export the module from `src/lib.rs`.
-5. Run `cargo test`.
+- 新增：`src/controller.rs`
+- 修改：`src/lib.rs`
+- 测试：`src/controller.rs`
 
-### Task 2: Preserve Controller Runtime and Restore Selected Node
+**步骤：**
 
-**Files:**
-- Modify: `src/clash.rs`
-- Modify: `src/lib.rs`
-- Test: `src/clash.rs`
+1. 编写 `/proxies` JSON 解析测试，覆盖策略组和节点。
+2. 编写代理名称 URL 编码测试，覆盖中文、空格和 `/`。
+3. 实现 `ClashController::proxy_state`、`test_delay`、`select_proxy`、`format_proxy_path`。
+4. 在 `src/lib.rs` 导出 controller 模块。
+5. 运行 `cargo test`。
 
-**Steps:**
-1. Add controller port and secret to `ClashRuntime`.
-2. Add `controller()` method returning a `ClashController`.
-3. After mihomo health check succeeds, restore `settings.proxy.selected_group` and `settings.proxy.selected_proxy` if both are still valid.
-4. If saved node is missing, continue startup and expose a warning through UI state instead of failing ChatGPT startup.
-5. Run `cargo test`.
+## 任务 2：保存 Controller 运行态并恢复节点
 
-### Task 3: Add Runtime IPC State
+**文件：**
 
-**Files:**
-- Modify: `src/main.rs`
-- Test: covered by compile and controller/clash unit tests
+- 修改：`src/clash.rs`
+- 修改：`src/lib.rs`
+- 测试：`src/clash.rs`
 
-**Steps:**
-1. Replace the static `handle_ipc_message` with an `Arc<Mutex<AppRuntimeState>>`.
-2. Add IPC command handling:
-   - `getProxyState`
-   - `saveSettings`
-   - `listProxyGroups`
-   - `testDelay`
-   - `testAllDelays`
-   - `selectProxy`
-   - `readProxyLogs`
-3. Return JSON responses to the page by evaluating a global callback function.
-4. Keep settings save behavior backward-compatible.
-5. Run `cargo clippy --all-targets -- -D warnings`.
+**步骤：**
 
-### Task 4: Upgrade Right-Bottom Settings UI
+1. 在 `ClashRuntime` 中保存 controller 端口和密钥。
+2. 增加 `controller()` 方法，返回 `ClashController`。
+3. mihomo 健康检查成功后，尝试恢复 `selected_group` 和 `selected_proxy`。
+4. 已保存节点不存在时，不阻塞启动，只在 UI 状态里提示。
+5. 运行 `cargo test`。
 
-**Files:**
-- Modify: `src/main.rs`
+## 任务 3：设置面板代理控制台
 
-**Steps:**
-1. Replace the simple settings form with three sections: status, subscription, node selection.
-2. Add group selector, node table, per-node delay, selected marker, and action buttons.
-3. Add UI states for disabled, loading, error, timeout, and saved.
-4. Add log preview area for latest mihomo log lines.
-5. Keep the UI compact enough to fit inside ChatGPT without blocking the main composer.
+**文件：**
 
-### Task 5: Subscription Refresh and Config Regeneration
+- 修改：`src/main.rs`
 
-**Files:**
-- Modify: `src/clash.rs`
-- Modify: `src/main.rs`
+**步骤：**
 
-**Steps:**
-1. Extract subscription/config generation into reusable functions.
-2. Add a refresh IPC command that downloads subscription, rewrites config, and asks mihomo to reload when possible.
-3. If live reload fails, keep the old runtime and show "restart required" instead of breaking the current session.
-4. Run `cargo test`.
+1. 增加 IPC 命令：获取代理状态、选择节点、测试延时、刷新订阅、读取日志。
+2. 在设置面板中展示订阅、策略组、节点、延时和运行日志。
+3. 保存节点选择到 `settings.toml`。
+4. 所有慢操作放到后台线程，避免卡住 WebView。
+5. 运行 `cargo test` 和手动节点切换测试。
 
-### Task 6: Docs, Packaging, and Manual Smoke
+## 验证
 
-**Files:**
-- Modify: `README.md`
-- Run: `scripts/package-portable.ps1`
-
-**Steps:**
-1. Document node selection, delay testing, log preview, persistence, and AppData paths.
-2. Run `cargo fmt`.
-3. Run `cargo test`.
-4. Run `cargo clippy --all-targets -- -D warnings`.
-5. Build portable package into `target_proxy_console_v03`.
-6. Launch the packaged EXE and verify one process starts.
+```powershell
+cargo fmt --check
+cargo test
+cargo clippy --all-targets -- -D warnings
+```

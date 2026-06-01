@@ -1,31 +1,53 @@
-# v0.4 Download Manager, Latency, and PDF Export Design
+# v0.4 下载中心、延时检测与 PDF 导出设计
 
-## Goal
+## 目标
 
-Improve the client for daily use by making connectivity visible, downloads traceable, and PDF export faithful to the rendered page.
+提升日常使用体验：让页面连通性可见、下载行为可追踪、PDF 导出更接近真实网页渲染效果。
 
-## Scope
+## 范围
 
-- Keep all generated files inside `C:\Users\admin\Desktop\新建文件夹 (8)\chatgpt_webview_client`.
-- Add a top toolbar latency pill to the left of the login/proxy pills.
-- Replace download-only toast behavior with a browser-like download manager panel.
-- Prefer WebView2 native PDF printing for PDF export, with the existing text export as fallback.
+- 所有生成文件保持在项目目录或应用数据目录内。
+- 顶部工具栏增加页面延时状态。
+- 下载从短暂 toast 升级为浏览器式下载管理。
+- PDF 导出优先使用 WebView 原生打印能力，失败时使用文本/PDF 回退。
 
-## Design
+## 设计
 
-### Latency
+### 延时检测
 
-The shell toolbar owns the visual state. It starts with `延时 --`, then sends `measureLatency` for the active site immediately and on a fixed interval. Rust runs a small script in the active content WebView so the measurement follows the same WebView profile and proxy path as real page traffic. The shell receives `LatencyEvent` and updates the pill to `延时 123ms` or `延时失败`.
+顶部 shell 负责显示状态，初始为 `延时 --`。应用启动后延迟几秒再测速，之后按固定间隔测速。测速请求通过当前页面 WebView 发起，确保使用同一个登录态和代理路径。Rust 将结果回传给 shell，显示 `延时 123ms` 或 `延时失败`。
 
-### Downloads
+### 下载中心
 
-Rust records download events in memory for the current app session. Each entry tracks id, file name, URL, path, status, byte size when known, and timestamp. Native WebView2 download callbacks and client-side blob/data downloads both feed this list. The shell has a download button and a panel showing recent items with actions: open file, open folder, clear completed items, and close panel. Toasts remain brief notifications, but the panel is the source of truth.
+Rust 记录下载事件。每条记录包含 id、文件名、URL、路径、状态、字节数和时间戳。WebView 原生下载回调、blob/data 下载兜底、导出功能都会写入同一套下载历史。
 
-### PDF Export
+下载中心提供：
 
-`导出 PDF` first calls WebView2 `PrintToPdf` on the active content WebView and writes to the Downloads folder with a unique filename. This preserves page layout far better than text extraction. If the platform API fails, Rust falls back to the existing markdown-to-PDF text path and reports the fallback in the download manager. Markdown export keeps the current text extraction path.
+- 查看记录。
+- 搜索记录。
+- 打开文件。
+- 打开所在目录。
+- 删除记录。
+- 清空已完成。
+- 跳转保存路径设置。
 
-## Testing
+### PDF 导出
 
-- Unit tests cover shell HTML controls, IPC parsing, download list serialization, latency script plumbing, and PDF filename/path helpers.
-- Full verification remains `cargo fmt --check`, `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo build --release`.
+Windows 优先调用 WebView2 `PrintToPdf` 保存当前页面。其他平台使用内置 PDF 回退生成。所有 PDF 导出结果都进入下载中心。
+
+## 测试
+
+- shell HTML 控件测试。
+- IPC 命令解析测试。
+- 下载历史序列化测试。
+- 延时脚本回传测试。
+- PDF 文件名和路径测试。
+
+完整验证：
+
+```powershell
+cargo fmt --check
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo build --release
+```

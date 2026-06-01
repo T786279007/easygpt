@@ -1,6 +1,6 @@
 param(
-    [string]$TargetDir = "target_v08_top_multipage",
-    [string]$PackageName = "ChatGPTWebviewClient",
+    [string]$TargetDir = "target_installer",
+    [string]$PackageName = "EasyGPT",
     [string]$AppVersion = "",
     [switch]$SkipBuild,
     [switch]$IncludeCurrentData
@@ -40,7 +40,7 @@ function Read-CargoVersion {
         return $versionLine.Matches[0].Groups[1].Value
     }
 
-    return "0.1.0"
+    return "0.1.1"
 }
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
@@ -58,7 +58,7 @@ try {
     }
 
     if (-not $SkipBuild) {
-        & (Join-Path $PSScriptRoot "package-portable.ps1") -TargetDir $PackageTargetDir -PackageName $PackageName
+        & (Join-Path $PSScriptRoot "package-portable.ps1") -TargetDir $PackageTargetDir -PackageName $PackageName -ExeName "EasyGPT.exe"
     }
 
     if (-not (Test-Path -LiteralPath $PackageDir)) {
@@ -98,7 +98,7 @@ try {
         throw "Inno Setup compiler failed with exit code $LASTEXITCODE"
     }
 
-    $installerPath = Join-Path $InstallerOutputDir "ChatGPTWebviewClient-Setup-$AppVersion.exe"
+    $installerPath = Join-Path $InstallerOutputDir "EasyGPT-windows-x64-Setup-$AppVersion.exe"
     if (-not (Test-Path -LiteralPath $installerPath)) {
         throw "Installer was not created at expected path: $installerPath"
     }
