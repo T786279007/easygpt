@@ -88,7 +88,7 @@ target_portable\portable\EasyGPT
 输出文件：
 
 ```text
-target_installer\installer\EasyGPT-windows-x64-Setup-0.1.1.exe
+target_installer\installer\EasyGPT-windows-x64-Setup-0.1.2.exe
 ```
 
 安装目录默认是：
@@ -237,8 +237,8 @@ data/Downloads
 发布命令示例：
 
 ```bash
-git tag v0.1.1
-git push origin v0.1.1
+git tag v0.1.2
+git push origin v0.1.2
 ```
 
 Release 产物包括：

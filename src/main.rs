@@ -307,9 +307,7 @@ impl DownloadHistory {
         let filename = event
             .path
             .as_ref()
-            .and_then(|path| path.file_name())
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.trim().is_empty())
+            .and_then(|path| cross_platform_file_name(path.as_os_str()))
             .or_else(|| {
                 event
                     .url
@@ -691,7 +689,10 @@ fn main() {
 }
 
 fn run_app() -> Result<()> {
+    #[cfg(windows)]
     let _single_instance = acquire_single_instance()?;
+    #[cfg(not(windows))]
+    acquire_single_instance()?;
     let profile_dir = ensure_webview_profile_dir()?;
     let mut settings = load_settings();
     heal_startup_runtime_ports(&mut settings)?;
@@ -5249,11 +5250,7 @@ fn download_destination_for_with_settings(
     suggested_path: &Path,
     settings: &DownloadSettings,
 ) -> PathBuf {
-    let filename = suggested_path
-        .file_name()
-        .filter(|name| !name.is_empty())
-        .map(|name| name.to_owned())
-        .unwrap_or_else(|| "download".into());
+    let filename = cross_platform_file_name(suggested_path.as_os_str()).unwrap_or("download");
     let mut destination = resolve_download_directory(settings);
     if let Err(error) = ensure_download_directory_writable(&destination) {
         eprintln!(
@@ -5265,6 +5262,12 @@ fn download_destination_for_with_settings(
     }
     destination.push(filename);
     unique_download_path(destination)
+}
+
+fn cross_platform_file_name(path: &std::ffi::OsStr) -> Option<&str> {
+    path.to_str()
+        .and_then(|value| value.rsplit(['/', '\\']).next())
+        .filter(|name| !name.trim().is_empty())
 }
 
 fn resolve_download_directory(settings: &DownloadSettings) -> PathBuf {
@@ -5514,6 +5517,18 @@ mod tests {
             Some("report.pdf")
         );
         assert!(destination.is_absolute());
+    }
+
+    #[test]
+    fn download_destination_uses_windows_basename_on_unix_hosts() {
+        let destination = super::download_destination_for(
+            PathBuf::from(r"C:\Users\tester\Downloads\report.pdf").as_path(),
+        );
+
+        assert_eq!(
+            destination.file_name().and_then(|name| name.to_str()),
+            Some("report.pdf")
+        );
     }
 
     #[test]
