@@ -1418,7 +1418,9 @@ rules:
 
     #[test]
     fn mihomo_path_candidates_include_project_root_when_running_from_target_release() {
-        let exe_dir = PathBuf::from(r"C:\repo\chatgpt_webview_client\target\release");
+        let exe_dir = ["repo", "chatgpt_webview_client", "target", "release"]
+            .iter()
+            .collect::<PathBuf>();
         let candidates = bundled_mihomo_path_candidates_from_exe_dir(&exe_dir);
         let rendered = candidates
             .iter()
