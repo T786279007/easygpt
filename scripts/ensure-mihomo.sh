@@ -58,23 +58,56 @@ fi
 
 mkdir -p "$(dirname "$destination")"
 work_dir="$project_root/target/mihomo-download-unix"
-rm -rf "$work_dir"
 mkdir -p "$work_dir"
 
 python3 - "$asset_pattern" "$work_dir" <<'PY'
 import fnmatch
 import json
+import os
 import pathlib
+import shutil
 import sys
+import time
+import urllib.error
 import urllib.request
 
 pattern = sys.argv[1]
 work_dir = pathlib.Path(sys.argv[2])
+token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+
+headers = {
+    "Accept": "application/vnd.github+json",
+    "User-Agent": "easygpt-packager",
+    "X-GitHub-Api-Version": "2022-11-28",
+}
+if token:
+    headers["Authorization"] = f"Bearer {token}"
+
+
+def open_with_retries(request, *, timeout=60, attempts=4):
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return urllib.request.urlopen(request, timeout=timeout)
+        except urllib.error.HTTPError as error:
+            last_error = error
+            if attempt == attempts or error.code not in {403, 429, 500, 502, 503, 504}:
+                raise
+        except urllib.error.URLError as error:
+            last_error = error
+            if attempt == attempts:
+                raise
+        sleep_seconds = min(30, 2 ** attempt)
+        print(f"Download attempt {attempt} failed: {last_error}; retrying in {sleep_seconds}s", file=sys.stderr)
+        time.sleep(sleep_seconds)
+    raise last_error
+
+
 request = urllib.request.Request(
     "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest",
-    headers={"User-Agent": "easygpt-packager"},
+    headers=headers,
 )
-with urllib.request.urlopen(request, timeout=60) as response:
+with open_with_retries(request) as response:
     release = json.load(response)
 
 assets = release.get("assets", [])
@@ -84,9 +117,18 @@ if asset is None:
     raise SystemExit(f"Could not find mihomo asset matching {pattern!r}. Available assets: {names}")
 
 archive_path = work_dir / asset["name"]
-print("Downloading mihomo:")
-print(asset["browser_download_url"])
-urllib.request.urlretrieve(asset["browser_download_url"], archive_path)
+if archive_path.exists() and archive_path.stat().st_size > 0:
+    print("Reusing downloaded mihomo:")
+    print(archive_path)
+else:
+    print("Downloading mihomo:")
+    print(asset["browser_download_url"])
+    asset_request = urllib.request.Request(
+        asset["browser_download_url"],
+        headers={"User-Agent": headers["User-Agent"], **({"Authorization": headers["Authorization"]} if "Authorization" in headers else {})},
+    )
+    with open_with_retries(asset_request, timeout=120) as response, archive_path.open("wb") as output:
+        shutil.copyfileobj(response, output)
 print(archive_path)
 PY
 
