@@ -100,6 +100,8 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Build macOS packages
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: bash scripts/package-macos.sh --target-dir target_ci_macos --arch ${{ matrix.arch }}
 
       - name: Upload macOS artifacts
@@ -149,6 +151,8 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Build Linux packages
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: bash scripts/package-linux.sh --target-dir target_ci_linux --arch x64
 
       - name: Upload Linux artifacts

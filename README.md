@@ -88,7 +88,7 @@ target_portable\portable\EasyGPT
 输出文件：
 
 ```text
-target_installer\installer\EasyGPT-windows-x64-Setup-0.1.2.exe
+target_installer\installer\EasyGPT-windows-x64-Setup-0.1.3.exe
 ```
 
 安装目录默认是：
@@ -203,6 +203,12 @@ data/clash/
 - 清空已完成记录。
 - 跳转下载路径设置。
 
+对话页面里的下载链接也会接入下载中心：
+
+- `blob:` / `data:` 文件由页面脚本读取后保存到本地。
+- 常见文件后缀的 `http` / `https` 链接会优先使用当前网页会话下载，保留 ChatGPT 等站点的 Cookie 和临时授权。
+- 如果网页会话下载失败，会回退到应用原生下载流程，并沿用当前代理设置。
+
 下载历史保存在：
 
 ```text
@@ -237,8 +243,8 @@ data/Downloads
 发布命令示例：
 
 ```bash
-git tag v0.1.2
-git push origin v0.1.2
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
 Release 产物包括：
