@@ -5,7 +5,10 @@ use std::{
     collections::HashMap,
     fmt::Write as _,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -61,6 +64,7 @@ const SHELL_PROTOCOL: &str = "aiclient";
 const SHELL_URL: &str = "aiclient://shell/index.html?v=download-manager-native-v2";
 const DOWNLOAD_HISTORY_FILE_NAME: &str = "downloads.json";
 const DEFAULT_MAX_DOWNLOAD_RECORDS: usize = 500;
+static DOWNLOAD_IPC_TOKEN_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum AiSite {
@@ -726,6 +730,7 @@ fn run_app() -> Result<()> {
     let mut runtime_ready = !matches!(settings.proxy.mode, ProxyMode::InternalClash);
     let mut download_history = load_download_history(settings.downloads.max_records);
     let mut download_manager_window: Option<DownloadManagerWindow> = None;
+    let mut download_ipc_tokens = HashMap::new();
     let main_window_id = window.id();
     let (window_width, window_height) = logical_window_size(&window);
     let shell_webview = build_shell_webview(
@@ -738,6 +743,7 @@ fn run_app() -> Result<()> {
     )
     .context("could not create the top navigation WebView2 instance")?;
     let mut content_webviews = HashMap::new();
+    let initial_download_ipc_token = new_download_ipc_token(initial_site);
     let initial_content = build_content_webview(
         &window,
         &mut web_context,
@@ -748,9 +754,11 @@ fn run_app() -> Result<()> {
         detected_proxy.as_ref(),
         runtime_ready,
         true,
+        &initial_download_ipc_token,
         event_proxy.clone(),
     )
     .context("could not create the initial content WebView2 instance")?;
+    download_ipc_tokens.insert(initial_site, initial_download_ipc_token);
     content_webviews.insert(initial_site, initial_content);
     apply_content_memory_policy(&content_webviews, active_site);
     sync_downloads(&shell_webview, &download_history);
@@ -784,6 +792,7 @@ fn run_app() -> Result<()> {
                                 &settings_json,
                                 detected_proxy.as_ref(),
                                 runtime_ready,
+                                &mut download_ipc_tokens,
                                 event_proxy.clone(),
                             );
                             if let Err(error) = result {
@@ -1011,6 +1020,26 @@ fn run_app() -> Result<()> {
                     let event_proxy = event_proxy.clone();
                     thread::spawn(move || {
                         let (response, event) = handle_save_download_message_with_event(&body);
+                        let _ = event_proxy
+                            .send_event(UserEvent::DownloadIpcResponse { target, response });
+                        let _ = event_proxy.send_event(UserEvent::DownloadEvent(event));
+                    });
+                    return;
+                }
+
+                if is_download_url_request(&body) {
+                    let event_proxy = event_proxy.clone();
+                    let proxy = latency_proxy_snapshot(&app_state);
+                    let expected_token = match target {
+                        IpcTarget::Site(site) => download_ipc_tokens.get(&site).cloned(),
+                        IpcTarget::Shell | IpcTarget::DownloadManager => None,
+                    };
+                    thread::spawn(move || {
+                        let (response, event) = handle_download_url_message_with_event(
+                            &body,
+                            proxy.as_ref(),
+                            expected_token.as_deref(),
+                        );
                         let _ = event_proxy
                             .send_event(UserEvent::DownloadIpcResponse { target, response });
                         let _ = event_proxy.send_event(UserEvent::DownloadEvent(event));
@@ -1367,6 +1396,15 @@ fn content_bounds(width: f64, height: f64) -> wry::Rect {
     }
 }
 
+fn new_download_ipc_token(site: AiSite) -> String {
+    let sequence = DOWNLOAD_IPC_TOKEN_SEQ.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{timestamp:x}-{sequence:x}", site.key())
+}
+
 fn logical_window_size(window: &Window) -> (f64, f64) {
     let size = window.inner_size().to_logical::<f64>(window.scale_factor());
     (size.width, size.height)
@@ -1414,6 +1452,7 @@ fn build_content_webview(
     detected_proxy: Option<&ProxySettings>,
     runtime_ready: bool,
     visible: bool,
+    download_ipc_token: &str,
     event_proxy: EventLoopProxy<UserEvent>,
 ) -> Result<WebView> {
     let target = IpcTarget::Site(site);
@@ -1424,7 +1463,7 @@ fn build_content_webview(
         .with_url(site_initial_url(settings, site, runtime_ready))
         .with_bounds(bounds)
         .with_visible(visible)
-        .with_initialization_script(download_interceptor_script())
+        .with_initialization_script(download_interceptor_script(download_ipc_token))
         .with_initialization_script(settings_button_script(settings_json))
         .with_ipc_handler(move |request| {
             let _ = event_proxy.send_event(UserEvent::Ipc {
@@ -1497,10 +1536,12 @@ fn switch_active_site(
     settings_json: &str,
     detected_proxy: Option<&ProxySettings>,
     runtime_ready: bool,
+    download_ipc_tokens: &mut HashMap<AiSite, String>,
     event_proxy: EventLoopProxy<UserEvent>,
 ) -> Result<()> {
     if let std::collections::hash_map::Entry::Vacant(entry) = content_webviews.entry(site) {
         let (width, height) = logical_window_size(window);
+        let download_ipc_token = new_download_ipc_token(site);
         let webview = build_content_webview(
             window,
             web_context,
@@ -1511,8 +1552,10 @@ fn switch_active_site(
             detected_proxy,
             runtime_ready,
             false,
+            &download_ipc_token,
             event_proxy,
         )?;
+        download_ipc_tokens.insert(site, download_ipc_token);
         entry.insert(webview);
     }
 
@@ -2792,11 +2835,12 @@ fn top_shell_response(active_site: AiSite) -> Response<Cow<'static, [u8]>> {
         .expect("top shell response headers are valid")
 }
 
-fn download_interceptor_script() -> &'static str {
+fn download_interceptor_script(download_ipc_token: &str) -> String {
     r#"
 (() => {
   if (window.__chatgptClientDownloadInterceptorInstalled) return;
   window.__chatgptClientDownloadInterceptorInstalled = true;
+  const downloadIpcToken = __DOWNLOAD_IPC_TOKEN__;
 
   const pending = new Map();
   let requestSeq = 0;
@@ -2816,16 +2860,24 @@ fn download_interceptor_script() -> &'static str {
     return window.ipc && typeof window.ipc.postMessage === 'function';
   }
 
-  function sendSaveDownload(payload) {
+  function sendDownloadCommand(type, payload, timeoutMs = 30000) {
     if (!canUseNativeIpc()) return Promise.reject(new Error('当前页面暂不能保存文件'));
     const id = `download-${++requestSeq}`;
     return new Promise((resolve, reject) => {
       pending.set(id, { resolve, reject });
-      window.ipc.postMessage(JSON.stringify({ id, type: 'saveDownload', payload }));
+      window.ipc.postMessage(JSON.stringify({ id, type, payload }));
       setTimeout(() => {
         if (pending.delete(id)) reject(new Error('保存文件超时'));
-      }, 30000);
+      }, timeoutMs);
     });
+  }
+
+  function sendSaveDownload(payload) {
+    return sendDownloadCommand('saveDownload', payload);
+  }
+
+  function sendDownloadUrl(payload) {
+    return sendDownloadCommand('downloadUrl', Object.assign({}, payload, { token: downloadIpcToken }), 300000);
   }
 
   function notifyDownloadError(message) {
@@ -2847,6 +2899,26 @@ fn download_interceptor_script() -> &'static str {
     } catch (_) {
       return 'download';
     }
+  }
+
+  function looksLikeDownloadUrl(url, anchor) {
+    if (!url.startsWith('http://') && !url.startsWith('https://')) return false;
+    if (anchor && anchor.hasAttribute('download')) return true;
+    try {
+      const parsed = new URL(url, window.location.href);
+      const last = decodeURIComponent(parsed.pathname.split('/').filter(Boolean).pop() || '');
+      if (/\.(7z|apk|csv|dmg|doc|docx|gz|json|md|pdf|pkg|ppt|pptx|rar|tar|txt|xls|xlsx|xml|yaml|yml|zip)$/i.test(last)) {
+        return true;
+      }
+      const text = String(anchor && anchor.textContent || '').trim();
+      return /\.(7z|apk|csv|dmg|doc|docx|gz|json|md|pdf|pkg|ppt|pptx|rar|tar|txt|xls|xlsx|xml|yaml|yml|zip)$/i.test(text);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function hasUserActivation() {
+    return !navigator.userActivation || navigator.userActivation.isActive;
   }
 
   function blobToBase64(blob) {
@@ -2880,19 +2952,35 @@ fn download_interceptor_script() -> &'static str {
     return sendSaveDownload({ filename, content_base64: contentBase64 });
   }
 
+  async function saveHttpUrl(url, filename) {
+    try {
+      const response = await fetch(url, { credentials: 'include' });
+      if (!response.ok) throw new Error(`读取下载内容失败：${response.status}`);
+      const blob = await response.blob();
+      const contentBase64 = await blobToBase64(blob);
+      return sendSaveDownload({ filename, content_base64: contentBase64 });
+    } catch (error) {
+      console.warn('[AI Web Client] browser-session download failed, using native URL download', error);
+      return sendDownloadUrl({ url, filename });
+    }
+  }
+
   async function saveClientSideDownload(url, filename) {
     if (url.startsWith('blob:')) return saveBlobUrl(url, filename);
     if (url.startsWith('data:')) return saveDataUrl(url, filename);
+    if (url.startsWith('http://') || url.startsWith('https://')) return saveHttpUrl(url, filename);
     return null;
   }
 
   function handleDownloadAnchor(anchor) {
     if (!anchor) return false;
     const href = anchor.href || '';
-    if (!href.startsWith('blob:') && !href.startsWith('data:')) return false;
+    if (!href.startsWith('blob:') && !href.startsWith('data:') && !looksLikeDownloadUrl(href, anchor)) return false;
+    if ((href.startsWith('http://') || href.startsWith('https://')) && !hasUserActivation()) return false;
     const filename = filenameFromAnchor(anchor, href);
     saveClientSideDownload(href, filename).catch(error => {
       console.warn('[AI Web Client] download fallback failed', error);
+      notifyDownloadError(error && error.message ? error.message : '下载失败');
     });
     return true;
   }
@@ -2915,6 +3003,14 @@ fn download_interceptor_script() -> &'static str {
     if (typeof url === 'string' && (url.startsWith('blob:') || url.startsWith('data:'))) {
       saveClientSideDownload(url, filenameFromAnchor(null, url)).catch(error => {
         console.warn('[AI Web Client] popup download fallback failed', error);
+      });
+      return null;
+    }
+    if (typeof url === 'string' && looksLikeDownloadUrl(url, null)) {
+      if (!hasUserActivation()) return nativeOpen ? nativeOpen.apply(window, arguments) : null;
+      saveClientSideDownload(url, filenameFromAnchor(null, url)).catch(error => {
+        console.warn('[AI Web Client] popup URL download failed', error);
+        notifyDownloadError(error && error.message ? error.message : '下载失败');
       });
       return null;
     }
@@ -2979,6 +3075,7 @@ fn download_interceptor_script() -> &'static str {
   });
 })();
 "#
+    .replace("__DOWNLOAD_IPC_TOKEN__", &json!(download_ipc_token).to_string())
 }
 
 fn export_conversation_script(site: AiSite, format: ExportFormat) -> String {
@@ -3462,6 +3559,12 @@ fn is_save_download_request(body: &str) -> bool {
         .is_some_and(|message| ipc_command(&message) == "saveDownload")
 }
 
+fn is_download_url_request(body: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .is_some_and(|message| ipc_command(&message) == "downloadUrl")
+}
+
 fn is_export_conversation_request(body: &str) -> bool {
     serde_json::from_str::<Value>(body)
         .ok()
@@ -3779,6 +3882,89 @@ fn handle_save_download_message_with_event(body: &str) -> (String, DownloadEvent
     }
 }
 
+fn handle_download_url_message_with_event(
+    body: &str,
+    proxy: Option<&ProxySettings>,
+    expected_token: Option<&str>,
+) -> (String, DownloadEvent) {
+    let message = match serde_json::from_str::<Value>(body) {
+        Ok(message) => message,
+        Err(error) => {
+            return (
+                ipc_error(None, format!("ignored invalid URL download IPC: {error}")),
+                DownloadEvent {
+                    kind: DownloadEventKind::Failed,
+                    status: "下载失败".to_string(),
+                    path: None,
+                    url: None,
+                    bytes: None,
+                    success: false,
+                },
+            );
+        }
+    };
+    let id = ipc_message_id(&message);
+    let request_url = download_url_from_message(&message).ok().map(str::to_string);
+    if let Err(error) = verify_download_ipc_token(&message, expected_token) {
+        return (
+            ipc_error(id.as_deref(), format!("{error:#}")),
+            DownloadEvent {
+                kind: DownloadEventKind::Failed,
+                status: "下载失败".to_string(),
+                path: None,
+                url: request_url,
+                bytes: None,
+                success: false,
+            },
+        );
+    }
+    match download_url_payload(&message, proxy) {
+        Ok(payload) => {
+            let path = payload
+                .get("path")
+                .and_then(Value::as_str)
+                .map(PathBuf::from);
+            let bytes = payload.get("bytes").and_then(Value::as_u64);
+            (
+                ipc_ok(id.as_deref(), payload),
+                DownloadEvent {
+                    kind: DownloadEventKind::Completed,
+                    status: "下载完成".to_string(),
+                    path,
+                    url: request_url,
+                    bytes,
+                    success: true,
+                },
+            )
+        }
+        Err(error) => (
+            ipc_error(id.as_deref(), format!("{error:#}")),
+            DownloadEvent {
+                kind: DownloadEventKind::Failed,
+                status: "下载失败".to_string(),
+                path: None,
+                url: request_url,
+                bytes: None,
+                success: false,
+            },
+        ),
+    }
+}
+
+fn verify_download_ipc_token(message: &Value, expected_token: Option<&str>) -> Result<()> {
+    let expected_token =
+        expected_token.context("download URL IPC is not allowed from this view")?;
+    let token = message
+        .get("payload")
+        .and_then(|payload| payload.get("token"))
+        .and_then(Value::as_str)
+        .context("download URL IPC token is missing")?;
+    if token != expected_token {
+        anyhow::bail!("download URL IPC token is invalid");
+    }
+    Ok(())
+}
+
 fn save_download_payload(message: &Value) -> Result<Value> {
     let payload = message
         .get("payload")
@@ -3805,6 +3991,90 @@ fn save_download_payload(message: &Value) -> Result<Value> {
         "path": path.display().to_string(),
         "bytes": bytes.len(),
     }))
+}
+
+fn download_url_payload(message: &Value, proxy: Option<&ProxySettings>) -> Result<Value> {
+    let payload = message
+        .get("payload")
+        .context("downloadUrl payload is missing")?;
+    let url = download_url_from_message(message)?;
+    let filename = payload
+        .get("filename")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| filename_from_url(url));
+    let client = download_http_client(proxy)?;
+    let response = client
+        .get(url)
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .with_context(|| format!("could not download {url}"))?;
+    let filename = response
+        .headers()
+        .get(reqwest::header::CONTENT_DISPOSITION)
+        .and_then(|header| header.to_str().ok())
+        .and_then(filename_from_content_disposition)
+        .unwrap_or(filename);
+    let bytes = response.bytes().context("could not read downloaded file")?;
+    let path = write_download_bytes(&filename, &bytes)?;
+
+    Ok(json!({
+        "path": path.display().to_string(),
+        "bytes": bytes.len(),
+    }))
+}
+
+fn download_url_from_message(message: &Value) -> Result<&str> {
+    let url = message
+        .get("payload")
+        .and_then(|payload| payload.get("url"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .context("download URL is missing")?;
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        anyhow::bail!("download URL must use http or https");
+    }
+    Ok(url)
+}
+
+fn download_http_client(proxy: Option<&ProxySettings>) -> Result<Client> {
+    let mut builder = Client::builder()
+        .timeout(Duration::from_secs(300))
+        .connect_timeout(Duration::from_secs(30))
+        .user_agent(concat!("EasyGPT/", env!("CARGO_PKG_VERSION"), " download"));
+
+    if let Some(proxy_settings) = proxy {
+        builder = builder.proxy(reqwest::Proxy::all(proxy_url(proxy_settings)?)?);
+    }
+
+    builder
+        .build()
+        .context("could not build download HTTP client")
+}
+
+fn filename_from_url(url: &str) -> String {
+    url.split(['?', '#'])
+        .next()
+        .and_then(|path| path.rsplit('/').next())
+        .filter(|segment| !segment.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "download".to_string())
+}
+
+fn filename_from_content_disposition(value: &str) -> Option<String> {
+    value.split(';').find_map(|part| {
+        let part = part.trim();
+        let filename = part
+            .strip_prefix("filename*=")
+            .or_else(|| part.strip_prefix("filename="))?;
+        let filename = filename
+            .trim_matches('"')
+            .trim_start_matches("UTF-8''")
+            .trim();
+        (!filename.is_empty()).then(|| filename.to_string())
+    })
 }
 
 fn write_download_bytes(filename: &str, bytes: &[u8]) -> Result<PathBuf> {
@@ -5443,7 +5713,13 @@ mod tests {
         AppSettings, CHATGPT_URL, DownloadSaveMode, DownloadSettings, ProxyMode,
     };
     use serde_json::json;
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        io::{Read, Write},
+        net::TcpListener,
+        path::PathBuf,
+        thread,
+    };
 
     #[test]
     fn site_catalog_includes_all_top_tabs_in_order() {
@@ -5579,10 +5855,11 @@ mod tests {
 
     #[test]
     fn content_initialization_script_installs_client_side_download_fallback() {
-        let script = download_interceptor_script();
+        let script = download_interceptor_script("test-token");
 
         assert!(script.contains("__chatgptClientDownloadInterceptorInstalled"));
-        assert!(script.contains("type: 'saveDownload'"));
+        assert!(script.contains("sendDownloadCommand('saveDownload', payload)"));
+        assert!(script.contains("const downloadIpcToken = \"test-token\";"));
         assert!(script.contains("content_base64"));
         assert!(script.contains("getAttribute('download')"));
         assert!(script.contains("href.startsWith('blob:')"));
@@ -5592,7 +5869,7 @@ mod tests {
 
     #[test]
     fn download_interceptor_supports_file_system_access_api_fallback() {
-        let script = download_interceptor_script();
+        let script = download_interceptor_script("test-token");
 
         assert!(script.contains("window.showSaveFilePicker"));
         assert!(script.contains("__aiClientNativeShowSaveFilePicker"));
@@ -5686,6 +5963,77 @@ mod tests {
         assert!(path.exists());
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn download_url_message_saves_http_response() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("server address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: text/plain\r\n\r\nhello",
+                )
+                .expect("write response");
+        });
+        let url = format!("http://{addr}/generated.txt");
+        let message = json!({
+            "id": "download-url-1",
+            "type": "downloadUrl",
+            "payload": {
+                "url": url,
+                "filename": "generated.txt",
+                "token": "download-token"
+            }
+        });
+
+        let (response, event) = super::handle_download_url_message_with_event(
+            &message.to_string(),
+            None,
+            Some("download-token"),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("response is json");
+        let path = event.path.clone().expect("event should include saved path");
+
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(event.status, "下载完成");
+        assert_eq!(event.url.as_deref(), Some(url.as_str()));
+        assert_eq!(fs::read(&path).expect("saved file should exist"), b"hello");
+
+        let _ = fs::remove_file(path);
+        server.join().expect("server exits");
+    }
+
+    #[test]
+    fn download_url_message_rejects_missing_ipc_token() {
+        let message = json!({
+            "id": "download-url-denied",
+            "type": "downloadUrl",
+            "payload": {
+                "url": "http://127.0.0.1/generated.txt",
+                "filename": "generated.txt"
+            }
+        });
+
+        let (response, event) = super::handle_download_url_message_with_event(
+            &message.to_string(),
+            None,
+            Some("download-token"),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&response).expect("response is json");
+
+        assert_eq!(parsed["ok"], false);
+        assert!(
+            parsed["error"]
+                .as_str()
+                .expect("error should be returned")
+                .contains("download URL IPC token is missing")
+        );
+        assert_eq!(event.status, "下载失败");
+        assert!(!event.success);
     }
 
     #[test]
@@ -6336,7 +6684,7 @@ mod tests {
 
     #[test]
     fn settings_script_intercepts_blob_and_data_download_links() {
-        let script = download_interceptor_script();
+        let script = download_interceptor_script("test-token");
 
         assert!(script.contains("__chatgptClientDownloadInterceptorInstalled"));
         assert!(script.contains("a[href]"));
@@ -6347,8 +6695,20 @@ mod tests {
     }
 
     #[test]
+    fn download_interceptor_routes_regular_http_links_to_native_download() {
+        let script = download_interceptor_script("test-token");
+
+        assert!(script.contains("sendDownloadCommand('downloadUrl', Object.assign({}, payload"));
+        assert!(script.contains("token: downloadIpcToken"));
+        assert!(script.contains("fetch(url, { credentials: 'include' })"));
+        assert!(script.contains("return sendDownloadUrl({ url, filename })"));
+        assert!(script.contains("url.startsWith('http://')"));
+        assert!(script.contains("url.startsWith('https://')"));
+    }
+
+    #[test]
     fn download_interceptor_handles_programmatic_anchor_clicks() {
-        let script = download_interceptor_script();
+        let script = download_interceptor_script("test-token");
 
         assert!(script.contains("HTMLAnchorElement.prototype.click"));
         assert!(script.contains("nativeAnchorClick"));

@@ -40,7 +40,7 @@ function Read-CargoVersion {
         return $versionLine.Matches[0].Groups[1].Value
     }
 
-    return "0.1.2"
+    return "0.1.3"
 }
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
