@@ -143,14 +143,64 @@ impl ExportFormat {
 }
 
 enum UserEvent {
-    Ipc { target: IpcTarget, body: String },
-    IpcResponse { target: IpcTarget, response: String },
-    DownloadIpcResponse { target: IpcTarget, response: String },
+    Ipc {
+        target: IpcTarget,
+        body: String,
+    },
+    IpcResponse {
+        target: IpcTarget,
+        response: String,
+        follow_up: Option<IpcFollowUp>,
+    },
+    DownloadIpcResponse {
+        target: IpcTarget,
+        response: String,
+    },
     DownloadEvent(DownloadEvent),
     LatencyEvent(LatencyEvent),
     StartupProgress(StartupProgress),
     RuntimeReady,
     RuntimeFailed(String),
+    ReloadContentWebviews(ContentWebviewReloadRequest),
+}
+
+#[derive(Debug, Clone)]
+enum IpcFollowUp {
+    ReloadContentWebviews(ContentWebviewReloadRequest),
+}
+
+#[derive(Debug, Clone)]
+struct ContentWebviewReloadRequest {
+    reopen_settings: bool,
+    status_message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SettingsChangeEffects {
+    restart_runtime: bool,
+    rebuild_content_webviews: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ProxySetupGuideState {
+    visible: bool,
+    needs_internal_clash: bool,
+    needs_subscription: bool,
+    needs_runtime: bool,
+    needs_group: bool,
+    needs_proxy: bool,
+    needs_connectivity_check: bool,
+    runtime_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ContentWebviewContext {
+    settings: AppSettings,
+    settings_json: String,
+    fallback_state_json: String,
+    detected_proxy: Option<ProxySettings>,
+    runtime_ready: bool,
+    runtime_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -545,9 +595,14 @@ impl AppRuntimeState {
         if matches!(self.settings.proxy.mode, ProxyMode::InternalClash) {
             match start_internal_clash(&self.settings) {
                 Ok(runtime) => {
+                    self.settings.proxy.mixed_port = runtime.mixed_port();
+                    self.settings.proxy.controller_port = runtime.controller_port();
                     self.clash_runtime = Some(runtime);
                     if let Err(error) = self.ensure_valid_proxy_selection() {
                         eprintln!("could not ensure valid proxy selection: {error:#}");
+                    }
+                    if let Err(error) = save_settings(&self.settings) {
+                        eprintln!("could not persist resolved runtime ports: {error:#}");
                     }
                     self.last_health = RuntimeHealth::Running;
                     true
@@ -701,8 +756,6 @@ fn run_app() -> Result<()> {
     let mut settings = load_settings();
     heal_startup_runtime_ports(&mut settings)?;
     save_settings(&settings)?;
-    let settings_json =
-        serde_json::to_string(&settings).context("could not serialize settings for UI")?;
     let mut initial_state = AppRuntimeState {
         settings: settings.clone(),
         clash_runtime: None,
@@ -724,7 +777,7 @@ fn run_app() -> Result<()> {
         .context("could not create the main window")?;
 
     let mut web_context = WebContext::new(Some(profile_dir));
-    let detected_proxy = startup_proxy(&settings);
+    let initial_content_context = content_webview_context_snapshot(&app_state)?;
     let initial_site = AiSite::ChatGpt;
     let mut active_site = initial_site;
     let mut runtime_ready = !matches!(settings.proxy.mode, ProxyMode::InternalClash);
@@ -738,7 +791,7 @@ fn run_app() -> Result<()> {
         &mut web_context,
         initial_site,
         top_bar_bounds(window_width),
-        detected_proxy.as_ref(),
+        initial_content_context.detected_proxy.as_ref(),
         event_proxy.clone(),
     )
     .context("could not create the top navigation WebView2 instance")?;
@@ -749,10 +802,11 @@ fn run_app() -> Result<()> {
         &mut web_context,
         initial_site,
         content_bounds(window_width, window_height),
-        &settings,
-        &settings_json,
-        detected_proxy.as_ref(),
-        runtime_ready,
+        &initial_content_context.settings,
+        &initial_content_context.settings_json,
+        &initial_content_context.fallback_state_json,
+        initial_content_context.detected_proxy.as_ref(),
+        initial_content_context.runtime_ready,
         true,
         &initial_download_ipc_token,
         event_proxy.clone(),
@@ -782,18 +836,23 @@ fn run_app() -> Result<()> {
                 if matches!(target, IpcTarget::Shell | IpcTarget::DownloadManager) {
                     match parse_shell_command(&body) {
                         Some(Ok(ShellCommand::SwitchSite(site))) => {
-                            let result = switch_active_site(
-                                site,
-                                &window,
-                                &mut web_context,
-                                &mut content_webviews,
-                                &mut active_site,
-                                &settings,
-                                &settings_json,
-                                detected_proxy.as_ref(),
-                                runtime_ready,
-                                &mut download_ipc_tokens,
-                                event_proxy.clone(),
+                            let result = content_webview_context_snapshot(&app_state).and_then(
+                                |context| {
+                                    switch_active_site(
+                                        site,
+                                        &window,
+                                        &mut web_context,
+                                        &mut content_webviews,
+                                        &mut active_site,
+                                        &context.settings,
+                                        &context.settings_json,
+                                        &context.fallback_state_json,
+                                        context.detected_proxy.as_ref(),
+                                        context.runtime_ready,
+                                        &mut download_ipc_tokens,
+                                        event_proxy.clone(),
+                                    )
+                                },
                             );
                             if let Err(error) = result {
                                 eprintln!("could not switch active site: {error:#}");
@@ -1067,11 +1126,19 @@ fn run_app() -> Result<()> {
                 let app_state = Arc::clone(&app_state);
                 let event_proxy = event_proxy.clone();
                 thread::spawn(move || {
-                    let response = handle_ipc_message_concurrent(&body, &app_state);
-                    let _ = event_proxy.send_event(UserEvent::IpcResponse { target, response });
+                    let concurrent = handle_ipc_message_concurrent(&body, &app_state);
+                    let _ = event_proxy.send_event(UserEvent::IpcResponse {
+                        target,
+                        response: concurrent.response,
+                        follow_up: concurrent.follow_up,
+                    });
                 });
             }
-            Event::UserEvent(UserEvent::IpcResponse { target, response }) => {
+            Event::UserEvent(UserEvent::IpcResponse {
+                target,
+                response,
+                follow_up,
+            }) => {
                 let script = format!(
                     "window.__chatgptClientReceive && window.__chatgptClientReceive({});",
                     response
@@ -1089,6 +1156,9 @@ fn run_app() -> Result<()> {
                 };
                 if let Err(error) = result {
                     eprintln!("could not send IPC response to target webview: {error:#}");
+                }
+                if let Some(IpcFollowUp::ReloadContentWebviews(request)) = follow_up {
+                    let _ = event_proxy.send_event(UserEvent::ReloadContentWebviews(request));
                 }
             }
             Event::UserEvent(UserEvent::DownloadIpcResponse { target, response }) => {
@@ -1180,6 +1250,43 @@ fn run_app() -> Result<()> {
                     }
                 }
             }
+            Event::UserEvent(UserEvent::ReloadContentWebviews(request)) => {
+                let result = content_webview_context_snapshot(&app_state).and_then(|context| {
+                    runtime_ready = context.runtime_ready;
+                    rebuild_content_webviews(
+                        &window,
+                        &mut web_context,
+                        &mut content_webviews,
+                        active_site,
+                        &mut download_ipc_tokens,
+                        &context,
+                        event_proxy.clone(),
+                    )?;
+                    if !context.runtime_ready
+                        && let Some(runtime_error) = context.runtime_error.as_deref()
+                    {
+                        let script = runtime_failed_script(runtime_error);
+                        for webview in content_webviews.values() {
+                            let _ = webview.evaluate_script(&script);
+                        }
+                    }
+                    if request.reopen_settings
+                        && let Some(webview) = content_webviews.get(&active_site)
+                    {
+                        let status = serde_json::to_string(&request.status_message)
+                            .unwrap_or_else(|_| "\"已应用代理设置\"".to_string());
+                        let script = format!(
+                            "window.__chatgptClientOpenSettings && window.__chatgptClientOpenSettings('proxy', {status});"
+                        );
+                        let _ = webview.evaluate_script(&script);
+                    }
+                    Ok(())
+                });
+                if let Err(error) = result {
+                    eprintln!("could not reload content webviews after settings change: {error:#}");
+                }
+                sync_shell_tabs(&shell_webview, active_site, &content_webviews);
+            }
             Event::LoopDestroyed => {
                 stop_runtime(&app_state);
             }
@@ -1247,6 +1354,129 @@ fn site_initial_url(settings: &AppSettings, site: AiSite, runtime_ready: bool) -
         waiting_page_url(site)
     } else {
         site.url().to_string()
+    }
+}
+
+fn settings_change_effects(previous: &AppSettings, next: &AppSettings) -> SettingsChangeEffects {
+    let restart_runtime = next.proxy.mode != previous.proxy.mode
+        || next.proxy.active_subscription_url() != previous.proxy.active_subscription_url()
+        || next.proxy.active_subscription_id != previous.proxy.active_subscription_id
+        || next.proxy.auto_update_subscription != previous.proxy.auto_update_subscription
+        || next.proxy.mixed_port != previous.proxy.mixed_port
+        || next.proxy.controller_port != previous.proxy.controller_port;
+    let rebuild_content_webviews = startup_proxy(previous) != startup_proxy(next);
+
+    SettingsChangeEffects {
+        restart_runtime,
+        rebuild_content_webviews,
+    }
+}
+
+fn runtime_proxy_for_content(state: &AppRuntimeState) -> Option<ProxySettings> {
+    match state.settings.proxy.mode {
+        ProxyMode::Direct => None,
+        ProxyMode::System => startup_proxy(&state.settings),
+        ProxyMode::InternalClash => state
+            .clash_runtime
+            .as_ref()
+            .map(ClashRuntime::proxy_settings)
+            .or_else(|| startup_proxy(&state.settings)),
+    }
+}
+
+fn content_webview_context_snapshot(
+    app_state: &Arc<Mutex<AppRuntimeState>>,
+) -> Result<ContentWebviewContext> {
+    let state = app_state
+        .lock()
+        .map_err(|error| anyhow::anyhow!("runtime state lock failed: {error}"))?;
+    let settings = state.settings.clone();
+    let settings_json =
+        serde_json::to_string(&settings).context("could not serialize settings for UI")?;
+    let fallback_state_json = serde_json::to_string(&json!({
+        "settings": settings,
+        "runtime_running": state.clash_runtime.is_some(),
+        "runtime_health": state.health_label(),
+        "runtime_error": state.runtime_error,
+        "mixed_port": state.clash_runtime.as_ref().map(ClashRuntime::mixed_port),
+        "controller_port": state.clash_runtime.as_ref().map(ClashRuntime::controller_port),
+        "proxy_state": Value::Null,
+        "guide": proxy_setup_guide_state(
+            &state.settings,
+            None,
+            state.clash_runtime.is_some(),
+            state.runtime_error.as_deref(),
+        ),
+        "controller_error": state.runtime_error,
+        "logs": read_mihomo_log_tail(80).unwrap_or_default(),
+    }))
+    .context("could not serialize fallback proxy state for UI")?;
+
+    Ok(ContentWebviewContext {
+        settings,
+        settings_json,
+        fallback_state_json,
+        detected_proxy: runtime_proxy_for_content(&state),
+        runtime_ready: !matches!(state.settings.proxy.mode, ProxyMode::InternalClash)
+            || state.clash_runtime.is_some(),
+        runtime_error: state.runtime_error.clone(),
+    })
+}
+
+fn proxy_setup_guide_state(
+    settings: &AppSettings,
+    proxy_state: Option<&ProxyState>,
+    runtime_running: bool,
+    runtime_error: Option<&str>,
+) -> ProxySetupGuideState {
+    let needs_internal_clash = !matches!(settings.proxy.mode, ProxyMode::InternalClash);
+    let needs_subscription = matches!(settings.proxy.mode, ProxyMode::InternalClash)
+        && settings.proxy.active_subscription_url().trim().is_empty();
+
+    let preferred_group =
+        proxy_state.and_then(|state| preferred_proxy_group(state, &settings.proxy.selected_group));
+    let preferred_node = preferred_group
+        .and_then(|group| preferred_proxy_node(group, &settings.proxy.selected_proxy));
+
+    let needs_runtime = matches!(settings.proxy.mode, ProxyMode::InternalClash)
+        && !needs_subscription
+        && !runtime_running;
+    let needs_group = matches!(settings.proxy.mode, ProxyMode::InternalClash)
+        && runtime_running
+        && !needs_subscription
+        && preferred_group.is_none();
+    let needs_proxy = matches!(settings.proxy.mode, ProxyMode::InternalClash)
+        && runtime_running
+        && !needs_subscription
+        && !needs_group
+        && preferred_node.is_none();
+    let runtime_error = runtime_error
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let needs_connectivity_check = matches!(settings.proxy.mode, ProxyMode::InternalClash)
+        && runtime_running
+        && !needs_subscription
+        && !needs_group
+        && !needs_proxy
+        && runtime_error.is_none();
+    let visible = needs_internal_clash
+        || needs_subscription
+        || needs_runtime
+        || needs_group
+        || needs_proxy
+        || needs_connectivity_check
+        || runtime_error.is_some();
+
+    ProxySetupGuideState {
+        visible,
+        needs_internal_clash,
+        needs_subscription,
+        needs_runtime,
+        needs_group,
+        needs_proxy,
+        needs_connectivity_check,
+        runtime_error,
     }
 }
 
@@ -1352,6 +1582,8 @@ fn runtime_failed_script(error_message: &str) -> String {
   hint.style.cssText = 'margin:6px 0;color:#555;';
   main.append(title, hint, message);
   document.body.appendChild(main);
+  window.__chatgptClientEnsureSettingsUi && window.__chatgptClientEnsureSettingsUi();
+  window.__chatgptClientOpenSettings && window.__chatgptClientOpenSettings('proxy', payload.message);
 }})();
 "#
     )
@@ -1449,6 +1681,7 @@ fn build_content_webview(
     bounds: wry::Rect,
     settings: &AppSettings,
     settings_json: &str,
+    fallback_state_json: &str,
     detected_proxy: Option<&ProxySettings>,
     runtime_ready: bool,
     visible: bool,
@@ -1464,7 +1697,7 @@ fn build_content_webview(
         .with_bounds(bounds)
         .with_visible(visible)
         .with_initialization_script(download_interceptor_script(download_ipc_token))
-        .with_initialization_script(settings_button_script(settings_json))
+        .with_initialization_script(settings_button_script(settings_json, fallback_state_json))
         .with_ipc_handler(move |request| {
             let _ = event_proxy.send_event(UserEvent::Ipc {
                 target,
@@ -1534,6 +1767,7 @@ fn switch_active_site(
     active_site: &mut AiSite,
     settings: &AppSettings,
     settings_json: &str,
+    fallback_state_json: &str,
     detected_proxy: Option<&ProxySettings>,
     runtime_ready: bool,
     download_ipc_tokens: &mut HashMap<AiSite, String>,
@@ -1549,6 +1783,7 @@ fn switch_active_site(
             content_bounds(width, height),
             settings,
             settings_json,
+            fallback_state_json,
             detected_proxy,
             runtime_ready,
             false,
@@ -1570,6 +1805,54 @@ fn switch_active_site(
         *active_site = site;
     }
     apply_content_memory_policy(content_webviews, *active_site);
+
+    Ok(())
+}
+
+fn rebuild_content_webviews(
+    window: &Window,
+    web_context: &mut WebContext,
+    content_webviews: &mut HashMap<AiSite, WebView>,
+    active_site: AiSite,
+    download_ipc_tokens: &mut HashMap<AiSite, String>,
+    context: &ContentWebviewContext,
+    event_proxy: EventLoopProxy<UserEvent>,
+) -> Result<()> {
+    let mut sites = loaded_sites(content_webviews);
+    if sites.is_empty() {
+        sites.push(active_site);
+    }
+    if !sites.contains(&active_site) {
+        sites.insert(0, active_site);
+    }
+
+    let (width, height) = logical_window_size(window);
+    let mut rebuilt_webviews = HashMap::new();
+    let mut rebuilt_tokens = HashMap::new();
+
+    for site in sites {
+        let download_ipc_token = new_download_ipc_token(site);
+        let webview = build_content_webview(
+            window,
+            web_context,
+            site,
+            content_bounds(width, height),
+            &context.settings,
+            &context.settings_json,
+            &context.fallback_state_json,
+            context.detected_proxy.as_ref(),
+            context.runtime_ready,
+            site == active_site,
+            &download_ipc_token,
+            event_proxy.clone(),
+        )?;
+        rebuilt_tokens.insert(site, download_ipc_token);
+        rebuilt_webviews.insert(site, webview);
+    }
+
+    *download_ipc_tokens = rebuilt_tokens;
+    *content_webviews = rebuilt_webviews;
+    apply_content_memory_policy(content_webviews, active_site);
 
     Ok(())
 }
@@ -3359,15 +3642,7 @@ fn latency_proxy_snapshot(app_state: &Arc<Mutex<AppRuntimeState>>) -> Option<Pro
         return None;
     };
 
-    match state.settings.proxy.mode {
-        ProxyMode::Direct => None,
-        ProxyMode::System => startup_proxy(&state.settings),
-        ProxyMode::InternalClash => state
-            .clash_runtime
-            .as_ref()
-            .map(ClashRuntime::proxy_settings)
-            .or_else(|| startup_proxy(&state.settings)),
-    }
+    runtime_proxy_for_content(&state)
 }
 
 fn latency_url_for_site(site: AiSite) -> &'static str {
@@ -3531,10 +3806,23 @@ fn bail_with_last_os_error(message: &str) -> Result<()> {
     ))
 }
 
-fn handle_ipc_message_concurrent(body: &str, app_state: &Arc<Mutex<AppRuntimeState>>) -> String {
+struct ConcurrentIpcResponse {
+    response: String,
+    follow_up: Option<IpcFollowUp>,
+}
+
+fn handle_ipc_message_concurrent(
+    body: &str,
+    app_state: &Arc<Mutex<AppRuntimeState>>,
+) -> ConcurrentIpcResponse {
     let message = match serde_json::from_str::<Value>(body) {
         Ok(message) => message,
-        Err(error) => return ipc_error(None, format!("ignored invalid IPC message: {error}")),
+        Err(error) => {
+            return ConcurrentIpcResponse {
+                response: ipc_error(None, format!("ignored invalid IPC message: {error}")),
+                follow_up: None,
+            };
+        }
     };
     let id = ipc_message_id(&message);
     let command = ipc_command(&message);
@@ -3550,7 +3838,32 @@ fn handle_ipc_message_concurrent(body: &str, app_state: &Arc<Mutex<AppRuntimeSta
         },
     };
 
-    ipc_result(id.as_deref(), result)
+    let follow_up = if command == "saveSettings" {
+        result.as_ref().ok().and_then(|payload| {
+            payload
+                .get("reload_content_webviews")
+                .and_then(Value::as_bool)
+                .filter(|reload| *reload)
+                .map(|_| {
+                    let status_message = payload
+                        .get("reload_status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("已保存，正在重新加载页面以应用代理设置")
+                        .to_string();
+                    IpcFollowUp::ReloadContentWebviews(ContentWebviewReloadRequest {
+                        reopen_settings: true,
+                        status_message,
+                    })
+                })
+        })
+    } else {
+        None
+    };
+
+    ConcurrentIpcResponse {
+        response: ipc_result(id.as_deref(), result),
+        follow_up,
+    }
 }
 
 fn is_save_download_request(body: &str) -> bool {
@@ -4229,9 +4542,9 @@ fn ipc_command(message: &Value) -> &str {
 
 fn proxy_state_payload(state: &AppRuntimeState) -> Result<Value> {
     let mut controller_error = state.runtime_error.clone();
-    let proxy_state = match state.clash_runtime.as_ref() {
+    let proxy_state_value = match state.clash_runtime.as_ref() {
         Some(runtime) => match runtime.controller()?.proxy_state() {
-            Ok(proxy_state) => Some(serde_json::to_value(proxy_state)?),
+            Ok(proxy_state) => Some(proxy_state),
             Err(error) => {
                 controller_error = Some(format!("{error:#}"));
                 None
@@ -4239,6 +4552,18 @@ fn proxy_state_payload(state: &AppRuntimeState) -> Result<Value> {
         },
         None => None,
     };
+    let guide_state = proxy_setup_guide_state(
+        &state.settings,
+        proxy_state_value.as_ref(),
+        state.clash_runtime.is_some(),
+        controller_error
+            .as_deref()
+            .or(state.runtime_error.as_deref()),
+    );
+    let proxy_state = proxy_state_value
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()?;
 
     Ok(json!({
         "settings": state.settings,
@@ -4248,6 +4573,7 @@ fn proxy_state_payload(state: &AppRuntimeState) -> Result<Value> {
         "mixed_port": state.clash_runtime.as_ref().map(ClashRuntime::mixed_port),
         "controller_port": state.clash_runtime.as_ref().map(ClashRuntime::controller_port),
         "proxy_state": proxy_state,
+        "guide": guide_state,
         "controller_error": controller_error,
         "logs": read_mihomo_log_tail(80).unwrap_or_default(),
     }))
@@ -4281,18 +4607,46 @@ fn save_settings_payload(message: &Value, state: &mut AppRuntimeState) -> Result
         .proxy
         .normalize_subscriptions_with_previous_active(Some(&previous_active));
 
+    let previous_proxy = runtime_proxy_for_content(state);
     save_settings(&settings)?;
-    let restart_required = settings.proxy.mode != state.settings.proxy.mode
-        || settings.proxy.active_subscription_url()
-            != state.settings.proxy.active_subscription_url()
-        || settings.proxy.active_subscription_id != state.settings.proxy.active_subscription_id
-        || settings.proxy.auto_update_subscription != state.settings.proxy.auto_update_subscription;
+    let effects = settings_change_effects(&state.settings, &settings);
+    let proxy_selection_changed = settings.proxy.selected_group
+        != state.settings.proxy.selected_group
+        || settings.proxy.selected_proxy != state.settings.proxy.selected_proxy;
     state.settings = settings;
-    if restart_required {
-        state.restart_clash_runtime();
+    let restarted = if effects.restart_runtime {
+        state.restart_clash_runtime()
+    } else {
+        false
+    };
+    if proxy_selection_changed
+        && !effects.restart_runtime
+        && matches!(state.settings.proxy.mode, ProxyMode::InternalClash)
+    {
+        state.ensure_clash_runtime()?;
+        let _ = state.ensure_valid_proxy_selection()?;
     }
+    let applied_proxy = runtime_proxy_for_content(state);
+    let reload_content_webviews = effects.rebuild_content_webviews
+        || previous_proxy != applied_proxy
+        || (state.runtime_error.is_some()
+            && matches!(state.settings.proxy.mode, ProxyMode::InternalClash));
 
-    Ok(json!({ "restart_required": false, "restarted": restart_required }))
+    let reload_status = if effects.restart_runtime {
+        "已保存，正在重新加载页面以应用新的代理设置"
+    } else {
+        "已保存，正在重新加载页面以应用代理设置"
+    };
+
+    Ok(json!({
+        "restart_required": effects.restart_runtime,
+        "restarted": restarted,
+        "reload_content_webviews": reload_content_webviews,
+        "reloadContentWebviews": reload_content_webviews,
+        "reload_status": reload_status,
+        "runtime_error": state.runtime_error,
+        "runtime_health": state.health_label(),
+    }))
 }
 
 fn select_proxy_payload(message: &Value, state: &mut AppRuntimeState) -> Result<Value> {
@@ -4754,10 +5108,11 @@ fn parse_memory_optimization_request_id(body: &str) -> Option<Option<String>> {
     }
 }
 
-fn settings_button_script(settings_json: &str) -> String {
+fn settings_button_script(settings_json: &str, fallback_state_json: &str) -> String {
     let script = r#"
 (() => {
   const initialSettings = __SETTINGS__;
+  const fallbackState = __FALLBACK_STATE__;
   const pending = new Map();
   const delays = new Map();
   let requestSeq = 0;
@@ -4776,15 +5131,12 @@ fn settings_button_script(settings_json: &str) -> String {
   window.__chatgptClientRuntimeReady = () => { runtimeReadyPending = true; };
 
   function canUseNativeIpc() {
-    return window.location.protocol !== 'data:'
-      && window.location.protocol !== 'about:'
-      && window.ipc
-      && typeof window.ipc.postMessage === 'function';
+    return window.ipc && typeof window.ipc.postMessage === 'function';
   }
 
   function sendCommand(type, payload = {}) {
     if (!canUseNativeIpc()) {
-      return Promise.reject(new Error('当前启动页暂不能读取设置，代理就绪后会自动打开 ChatGPT'));
+      return Promise.reject(new Error('当前页面暂不能读取设置'));
     }
     const id = String(++requestSeq);
     return new Promise((resolve, reject) => {
@@ -4840,12 +5192,14 @@ fn settings_button_script(settings_json: &str) -> String {
   }
 
   function installSettingsButton() {
-    if (document.getElementById('chatgpt-client-settings-button')) return;
     if (!document.body) return;
+    if (document.getElementById('chatgpt-client-settings-button')
+      && document.getElementById('chatgpt-client-settings-panel')) return;
 
-    const style = document.createElement('style');
-    style.id = 'chatgpt-client-settings-style';
-    style.textContent = `
+    if (!document.getElementById('chatgpt-client-settings-style')) {
+      const style = document.createElement('style');
+      style.id = 'chatgpt-client-settings-style';
+      style.textContent = `
       #chatgpt-client-settings-button {
         position: fixed; right: 20px; bottom: 92px; z-index: 2147483647;
         width: 40px; height: 40px; border: 1px solid rgba(0,0,0,.14);
@@ -4888,6 +5242,17 @@ fn settings_button_script(settings_json: &str) -> String {
       .cgpt-client-path-row label { margin: 0 !important; }
       .cgpt-client-download-hint { margin: 5px 0 8px; color: #666; font-size: 12px; word-break: break-all; }
       .cgpt-client-download-tools { display: flex; align-items: flex-end; justify-content: flex-end; gap: 8px; margin: 8px 0; }
+      .cgpt-client-guide {
+        display: grid; gap: 10px; margin: 12px 0; padding: 12px; border: 1px solid #dbe4f0;
+        border-radius: 8px; background: #f8fbff;
+      }
+      .cgpt-client-guide[hidden] { display: none; }
+      .cgpt-client-guide-title { font-weight: 650; }
+      .cgpt-client-guide-note { color: #555; font-size: 12px; }
+      .cgpt-client-guide-steps { display: grid; gap: 6px; }
+      .cgpt-client-guide-step { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; color: #333; }
+      .cgpt-client-guide-step[data-done="true"] { color: #087a2e; }
+      .cgpt-client-guide-step strong { font-size: 12px; }
       .cgpt-client-node-grid {
         display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 8px; margin-top: 8px;
       }
@@ -4929,7 +5294,8 @@ fn settings_button_script(settings_json: &str) -> String {
         border: 1px solid #e1e1e1; border-radius: 6px; background: #fafafa; padding: 8px; color: #333; font-size: 12px;
       }
     `;
-    document.documentElement.appendChild(style);
+      document.documentElement.appendChild(style);
+    }
 
     const button = document.createElement('button');
     button.id = 'chatgpt-client-settings-button';
@@ -4951,6 +5317,7 @@ fn settings_button_script(settings_json: &str) -> String {
           <span class="cgpt-client-pill" data-view="runtime">状态：读取中</span>
           <span class="cgpt-client-pill" data-view="current">节点：未选择</span>
         </div>
+        <section class="cgpt-client-guide" data-view="guide" hidden></section>
 
         <h3>订阅与模式</h3>
         <label>代理模式
@@ -5092,6 +5459,7 @@ fn settings_button_script(settings_json: &str) -> String {
     const views = {
       runtime: panel.querySelector('[data-view="runtime"]'),
       current: panel.querySelector('[data-view="current"]'),
+      guide: panel.querySelector('[data-view="guide"]'),
       nodes: panel.querySelector('[data-view="nodes"]'),
       log: panel.querySelector('#chatgpt-client-log'),
       status: panel.querySelector('#chatgpt-client-settings-status'),
@@ -5172,12 +5540,31 @@ fn settings_button_script(settings_json: &str) -> String {
     window.__chatgptClientUpdateDownloadSettings = (updates = {}) => {
       setDownloadSettings({ ...downloadSettings, ...updates });
     };
-    window.__chatgptClientOpenSettings = (section) => {
+    async function openSettingsPanel(section, statusMessage = '', shouldRefresh = true) {
+      if (!button.isConnected || !panel.isConnected) {
+        document.body.append(button, panel);
+      }
       panel.hidden = false;
-      if (section === 'downloads') {
+      if (section === 'proxy') {
+        views.guide?.scrollIntoView({ block: 'start' });
+        fields.mode?.focus();
+      } else if (section === 'downloads') {
         panel.querySelector('[data-section="downloads"]')?.scrollIntoView({ block: 'start' });
         fields.download_fixed_dir?.focus();
       }
+      if (shouldRefresh && canUseNativeIpc()) {
+        try {
+          await refreshState();
+          if (statusMessage) setStatus(statusMessage);
+        } catch (error) {
+          setStatus(error.message || statusMessage || '读取代理状态失败');
+        }
+      } else if (statusMessage) {
+        setStatus(statusMessage);
+      }
+    }
+    window.__chatgptClientOpenSettings = (section, statusMessage = '') => {
+      void openSettingsPanel(section, statusMessage, true);
     };
     function normalizeSubscriptions(proxy) {
       const list = Array.isArray(proxy.subscriptions) ? proxy.subscriptions : [];
@@ -5268,6 +5655,7 @@ fn settings_button_script(settings_json: &str) -> String {
       const groups = currentData?.proxy_state?.groups || [];
       const group = groups.find(item => item.name === fields.group_select.value);
       if (!group) {
+        fields.group_select.innerHTML = '';
         views.nodes.innerHTML = '<div class="cgpt-client-node-empty">内置 Clash 未运行或暂无策略组</div>';
         return;
       }
@@ -5290,7 +5678,86 @@ fn settings_button_script(settings_json: &str) -> String {
               <button class="cgpt-client-btn" type="button" data-node="${escapeAttr(node.name)}" data-action="test-node">测速</button>
             </div>
           </article>`;
-      }).join('');
+        }).join('');
+    }
+    function renderGuide() {
+      const guide = currentData?.guide || { visible: false };
+      if (!views.guide) return;
+      if (!guide.visible) {
+        views.guide.hidden = true;
+        views.guide.innerHTML = '';
+        return;
+      }
+      const step1Done = !guide.needs_internal_clash;
+      const step2Done = step1Done && !guide.needs_subscription;
+      const step3Done = step2Done && !guide.needs_runtime;
+      const step4Done = step3Done && !guide.needs_group && !guide.needs_proxy;
+      const step5Done = step4Done && !guide.needs_connectivity_check && !guide.runtime_error;
+      const steps = [
+        {
+          done: step1Done,
+          title: '切换到内置 Clash',
+          detail: guide.needs_internal_clash ? '先把代理模式改成“内置 Clash”，再保存设置。' : '当前已使用内置 Clash。',
+        },
+        {
+          done: step2Done,
+          title: '填写订阅链接',
+          detail: !step1Done
+            ? '先切换到内置 Clash，再填写订阅。'
+            : guide.needs_subscription
+              ? '在“新增订阅链接”里粘贴订阅，再添加为新订阅。'
+              : '已存在可用订阅。',
+        },
+        {
+          done: step3Done,
+          title: '保存并启动代理',
+          detail: !step2Done
+            ? '订阅准备好后再保存，启动内置 mihomo。'
+            : guide.needs_runtime
+              ? '保存设置后会启动内置 mihomo。'
+              : '代理运行状态已就绪。',
+        },
+        {
+          done: step4Done,
+          title: '选择策略组和节点',
+          detail: !step3Done
+            ? '代理启动后再刷新订阅并选择节点。'
+            : guide.needs_group || guide.needs_proxy
+              ? '刷新订阅后从下方策略组里选择节点，或直接选最快节点。'
+              : '策略组和节点已可用。',
+        },
+        {
+          done: step5Done,
+          title: '检测 ChatGPT 连通性',
+          detail: !step4Done
+            ? '节点就绪后再检测 ChatGPT 连通性。'
+            : guide.needs_connectivity_check
+              ? '最后执行一次连通性检测，确认当前节点可访问。'
+              : '已经可以开始检测或使用。',
+        },
+      ];
+      const note = guide.runtime_error
+        ? `当前代理启动异常：${escapeHtml(guide.runtime_error)}`
+        : '首次使用按下面顺序完成即可。';
+      views.guide.hidden = false;
+      views.guide.innerHTML = `
+        <div class="cgpt-client-guide-title">新用户设置引导</div>
+        <div class="cgpt-client-guide-note">${note}</div>
+        <div class="cgpt-client-guide-steps">
+          ${steps.map((step, index) => `
+            <div class="cgpt-client-guide-step" data-done="${step.done}">
+              <strong>${index + 1}.</strong>
+              <div><div>${escapeHtml(step.title)}</div><div class="cgpt-client-guide-note">${escapeHtml(step.detail)}</div></div>
+            </div>`).join('')}
+        </div>
+        <div class="cgpt-client-actions">
+          <button class="cgpt-client-btn" type="button" data-action="guide-use-internal-clash">使用内置 Clash</button>
+          <button class="cgpt-client-btn" type="button" data-action="guide-save-settings">保存设置</button>
+          <button class="cgpt-client-btn" type="button" data-action="guide-refresh-subscription">刷新订阅</button>
+          <button class="cgpt-client-btn" type="button" data-action="guide-select-fastest">选择最快节点</button>
+          <button class="cgpt-client-btn" type="button" data-action="guide-verify-chatgpt">检测 ChatGPT</button>
+        </div>
+      `;
     }
     function renderState(data) {
       currentData = data;
@@ -5299,6 +5766,7 @@ fn settings_button_script(settings_json: &str) -> String {
       if (data.controller_error || data.runtime_error) setStatus(data.controller_error || data.runtime_error);
       views.log.textContent = data.logs || '暂无日志';
       renderGroups();
+      renderGuide();
     }
     function currentGroup() {
       const groups = currentData?.proxy_state?.groups || [];
@@ -5357,6 +5825,16 @@ fn settings_button_script(settings_json: &str) -> String {
       renderState(data);
       setStatus('');
     }
+    async function persistSettings(defaultMessage) {
+      const result = await sendCommand('saveSettings', { settings: readSettings() });
+      if (result.reloadContentWebviews) {
+        setStatus(result.reload_status || defaultMessage || '已保存');
+        return result;
+      }
+      if (result.restarted) await refreshState();
+      setStatus(defaultMessage || (result.restarted ? '已保存并重启内置代理' : '已保存'));
+      return result;
+    }
     window.__chatgptClientRuntimeReady = async () => {
       runtimeReadyPending = false;
       try {
@@ -5368,6 +5846,10 @@ fn settings_button_script(settings_json: &str) -> String {
     };
 
     setSettings(initialSettings);
+    currentData = fallbackState;
+    if (!canUseNativeIpc()) {
+      renderState(fallbackState);
+    }
     if (runtimeReadyPending) window.__chatgptClientRuntimeReady();
     fields.subscription_select.addEventListener('change', () => {
       activeSubscriptionId = fields.subscription_select.value;
@@ -5386,10 +5868,8 @@ fn settings_button_script(settings_json: &str) -> String {
       downloadSettings.max_records = Number(fields.download_max_records.value || 500);
     });
     button.addEventListener('click', async () => {
-      panel.hidden = !panel.hidden;
-      if (!panel.hidden) {
-        try { await refreshState(); } catch (error) { setStatus(error.message); }
-      }
+      if (panel.hidden) await openSettingsPanel('proxy', '', true);
+      else panel.hidden = true;
     });
     fields.group_select.addEventListener('change', renderNodes);
     panel.addEventListener('click', async (event) => {
@@ -5398,27 +5878,19 @@ fn settings_button_script(settings_json: &str) -> String {
       const action = target.dataset.action;
       try {
         if (action === 'save') {
-          const result = await sendCommand('saveSettings', { settings: readSettings() });
-          if (result.restarted) await refreshState();
-          setStatus(result.restarted ? '已保存并重启内置代理' : '已保存');
+          await persistSettings('已保存');
         } else if (action === 'close-panel') {
           panel.hidden = true;
         } else if (action === 'add-subscription') {
           addSubscriptionFromEditor();
-          const result = await sendCommand('saveSettings', { settings: readSettings() });
-          if (result.restarted) await refreshState();
-          setStatus(result.restarted ? '订阅已添加并重启内置代理' : '订阅已添加');
+          await persistSettings('订阅已添加');
         } else if (action === 'update-subscription') {
           syncSubscriptionEditor();
           renderSubscriptions();
-          const result = await sendCommand('saveSettings', { settings: readSettings() });
-          if (result.restarted) await refreshState();
-          setStatus(result.restarted ? '订阅已更新并重启内置代理' : '订阅已更新');
+          await persistSettings('订阅已更新');
         } else if (action === 'delete-subscription') {
           deleteActiveSubscription();
-          const result = await sendCommand('saveSettings', { settings: readSettings() });
-          if (result.restarted) await refreshState();
-          setStatus(result.restarted ? '订阅已删除并重启内置代理' : '订阅已删除');
+          await persistSettings('订阅已删除');
         } else if (action === 'choose-download-dir') {
           const current = fields.download_fixed_dir.value.trim() || 'data/Downloads';
           const next = window.prompt('请输入下载内容保存位置', current);
@@ -5436,6 +5908,40 @@ fn settings_button_script(settings_json: &str) -> String {
           setStatus('已恢复默认下载目录，保存设置后生效');
         } else if (action === 'reload') {
           await refreshState();
+        } else if (action === 'guide-use-internal-clash') {
+          fields.mode.value = 'internal_clash';
+          setStatus('已切换为内置 Clash，点击保存设置应用');
+          fields.mode.focus();
+        } else if (action === 'guide-save-settings') {
+          await persistSettings('已保存');
+        } else if (action === 'guide-refresh-subscription') {
+          if (!subscriptions.length) {
+            if (fields.new_subscription_url.value.trim()) {
+              addSubscriptionFromEditor();
+            } else if (fields.subscription_url.value.trim()) {
+              const url = fields.subscription_url.value.trim();
+              const name = fields.subscription_name.value.trim() || '默认订阅';
+              const id = makeSubscriptionId(`${url}:${Date.now()}`);
+              subscriptions.push({ id, name, url });
+              activeSubscriptionId = id;
+              renderSubscriptions();
+            } else {
+              throw new Error('请先填写订阅链接');
+            }
+          }
+          const saved = await persistSettings('订阅已保存');
+          if (saved.reloadContentWebviews) return;
+          setStatus('正在刷新订阅...');
+          const result = await sendCommand('refreshSubscription');
+          await refreshState();
+          setStatus(result.restart_required ? '订阅已刷新，重启后完全生效' : '订阅已刷新');
+        } else if (action === 'guide-select-fastest') {
+          if (!currentGroup()) await refreshState();
+          await runIncrementalDelayTests({ selectFastest: true });
+        } else if (action === 'guide-verify-chatgpt') {
+          setStatus('正在检测 ChatGPT 连通性...');
+          const result = await sendCommand('checkChatGpt');
+          setStatus(result.ok ? `ChatGPT 可访问，延时 ${result.delay_ms ?? '-'} ms` : `ChatGPT 检测失败：${result.error || '未知错误'}`);
         } else if (action === 'select-node') {
           const group = fields.group_select.value;
           const proxy = target.dataset.node;
@@ -5487,6 +5993,10 @@ fn settings_button_script(settings_json: &str) -> String {
       }
     });
   }
+  window.__chatgptClientEnsureSettingsUi = () => {
+    installSettingsButton();
+    return Boolean(document.getElementById('chatgpt-client-settings-button'));
+  };
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', installSettingsButton, { once: true });
@@ -5497,7 +6007,9 @@ fn settings_button_script(settings_json: &str) -> String {
 })();
 "#;
 
-    script.replace("__SETTINGS__", settings_json)
+    script
+        .replace("__SETTINGS__", settings_json)
+        .replace("__FALLBACK_STATE__", fallback_state_json)
 }
 
 fn apply_proxy_config<'a>(
@@ -6633,7 +7145,7 @@ mod tests {
 
     #[test]
     fn settings_panel_is_centered_with_footer_actions() {
-        let script = settings_button_script(r#"{"proxy":{}}"#);
+        let script = settings_button_script(r#"{"proxy":{}}"#, "{}");
 
         assert!(script.contains("left: 50%; top: 50%;"));
         assert!(script.contains("transform: translate(-50%, -50%);"));
@@ -6644,7 +7156,7 @@ mod tests {
 
     #[test]
     fn settings_script_keeps_proxy_controls_without_old_site_switcher() {
-        let script = settings_button_script(r#"{"proxy":{}}"#);
+        let script = settings_button_script(r#"{"proxy":{}}"#, "{}");
 
         assert!(!script.contains("chatgpt-client-status-chip"));
         assert!(!script.contains("data-view=\"quick_nodes\""));
@@ -6662,7 +7174,7 @@ mod tests {
 
     #[test]
     fn settings_script_exposes_memory_optimization_action() {
-        let script = settings_button_script(r#"{"proxy":{}}"#);
+        let script = settings_button_script(r#"{"proxy":{}}"#, "{}");
 
         assert!(script.contains("data-action=\"optimize-memory\""));
         assert!(script.contains("optimizeMemory"));
@@ -6671,7 +7183,7 @@ mod tests {
 
     #[test]
     fn settings_script_exposes_download_path_controls() {
-        let script = settings_button_script(r#"{"proxy":{},"downloads":{}}"#);
+        let script = settings_button_script(r#"{"proxy":{},"downloads":{}}"#, "{}");
 
         assert!(script.contains("下载内容保存位置"));
         assert!(script.contains("使用上次下载目录"));
@@ -6680,6 +7192,28 @@ mod tests {
         assert!(script.contains("data-field=\"download_max_records\""));
         assert!(script.contains("data-action=\"choose-download-dir\""));
         assert!(script.contains("window.__chatgptClientUpdateDownloadSettings"));
+    }
+
+    #[test]
+    fn settings_script_exposes_proxy_setup_guide_and_reload_apply_hook() {
+        let script = settings_button_script(r#"{"proxy":{},"downloads":{}}"#, "{}");
+
+        assert!(script.contains("data-view=\"guide\""));
+        assert!(script.contains("renderGuide()"));
+        assert!(script.contains("guide-use-internal-clash"));
+        assert!(script.contains("guide-refresh-subscription"));
+        assert!(script.contains("guide-select-fastest"));
+        assert!(script.contains("guide-verify-chatgpt"));
+        assert!(script.contains("reloadContentWebviews"));
+    }
+
+    #[test]
+    fn settings_script_bootstraps_fallback_state_for_non_ipc_pages() {
+        let script = settings_button_script(r#"{"proxy":{},"downloads":{}}"#, "{}");
+
+        assert!(script.contains("const fallbackState ="));
+        assert!(script.contains("renderState(fallbackState);"));
+        assert!(script.contains("!canUseNativeIpc()"));
     }
 
     #[test]
@@ -6735,13 +7269,83 @@ mod tests {
 
     #[test]
     fn settings_script_uses_separate_fields_for_new_subscription() {
-        let script = settings_button_script(r#"{"proxy":{}}"#);
+        let script = settings_button_script(r#"{"proxy":{}}"#, "{}");
 
         assert!(script.contains("data-field=\"new_subscription_name\""));
         assert!(script.contains("data-field=\"new_subscription_url\""));
         assert!(script.contains("fields.new_subscription_url.value.trim()"));
         assert!(script.contains("fields.new_subscription_url.value = '';"));
         assert!(script.contains(">添加为新订阅</button>"));
+    }
+
+    #[test]
+    fn settings_change_effects_restart_internal_clash_without_forcing_webview_rebuild() {
+        let mut previous = AppSettings::default();
+        previous.proxy.mode = ProxyMode::InternalClash;
+        previous.proxy.subscription_url = "https://example.com/sub-a".to_string();
+
+        let mut next = previous.clone();
+        next.proxy.subscription_url = "https://example.com/sub-b".to_string();
+
+        let effects = super::settings_change_effects(&previous, &next);
+
+        assert!(effects.restart_runtime);
+        assert!(!effects.rebuild_content_webviews);
+    }
+
+    #[test]
+    fn settings_change_effects_rebuild_content_webviews_when_proxy_endpoint_changes() {
+        let previous = AppSettings::default();
+
+        let mut next = previous.clone();
+        next.proxy.mode = ProxyMode::InternalClash;
+        next.proxy.mixed_port = 18998;
+
+        let effects = super::settings_change_effects(&previous, &next);
+
+        assert!(effects.restart_runtime);
+        assert!(effects.rebuild_content_webviews);
+    }
+
+    #[test]
+    fn proxy_setup_guide_is_visible_for_default_system_mode() {
+        let settings = AppSettings::default();
+
+        let guide = super::proxy_setup_guide_state(&settings, None, false, None);
+
+        assert!(guide.visible);
+        assert!(guide.needs_internal_clash);
+        assert!(!guide.needs_connectivity_check);
+    }
+
+    #[test]
+    fn proxy_setup_guide_stays_visible_for_connectivity_check() {
+        use chatgpt_webview_client::controller::{ProxyGroup, ProxyNode, ProxyState};
+
+        let mut settings = AppSettings::default();
+        settings.proxy.mode = ProxyMode::InternalClash;
+        settings.proxy.subscription_url = "https://example.com/sub".to_string();
+        settings.proxy.active_subscription_id = "sub-1".to_string();
+        settings.proxy.selected_group = "PROXY".to_string();
+        settings.proxy.selected_proxy = "AUTO".to_string();
+
+        let proxy_state = ProxyState {
+            groups: vec![ProxyGroup {
+                name: "PROXY".to_string(),
+                selected: "AUTO".to_string(),
+                nodes: vec![ProxyNode {
+                    name: "AUTO".to_string(),
+                    kind: "Selector".to_string(),
+                }],
+            }],
+        };
+
+        let guide = super::proxy_setup_guide_state(&settings, Some(&proxy_state), true, None);
+
+        assert!(guide.visible);
+        assert!(!guide.needs_internal_clash);
+        assert!(!guide.needs_subscription);
+        assert!(guide.needs_connectivity_check);
     }
 
     #[cfg(windows)]
@@ -6817,13 +7421,16 @@ mod tests {
     }
 
     #[test]
-    fn settings_script_blocks_ipc_from_opaque_waiting_page() {
-        let script = settings_button_script(r#"{"proxy":{}}"#);
+    fn settings_script_uses_runtime_ipc_availability_instead_of_protocol_blocklist() {
+        let script = settings_button_script(r#"{"proxy":{}}"#, "{}");
 
         assert!(script.contains("function canUseNativeIpc()"));
-        assert!(script.contains("window.location.protocol !== 'data:'"));
-        assert!(script.contains("window.location.protocol !== 'about:'"));
-        assert!(script.contains("当前启动页暂不能读取设置"));
+        assert!(
+            script.contains("return window.ipc && typeof window.ipc.postMessage === 'function';")
+        );
+        assert!(!script.contains("window.location.protocol !== 'data:'"));
+        assert!(!script.contains("window.location.protocol !== 'about:'"));
+        assert!(script.contains("当前页面暂不能读取设置"));
     }
 
     #[test]
@@ -6845,6 +7452,7 @@ mod tests {
         assert!(script.contains("missing mihomo"));
         assert!(script.contains("resources/clash/mihomo"));
         assert!(script.contains("document.body.innerHTML = '';"));
+        assert!(script.contains("window.__chatgptClientEnsureSettingsUi"));
     }
 
     #[test]

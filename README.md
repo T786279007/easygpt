@@ -7,8 +7,10 @@ EasyGPT 是一个轻量级 AI 网页桌面客户端，基于 Rust、Tao、Wry �
 - 顶部工具栏支持 ChatGPT、Gemini、NotebookLM、Google AI Studio 多页面切换。
 - 登录态保存在本地 `data/WebView2Profile`，下次启动尽量免重新登录。
 - 应用设置保存在 `data/settings.toml`。
-- 支持直连、系统代理、手动代理、内置 mihomo 代理。
+- 支持直连、系统代理、内置 mihomo 代理。
 - 支持多个订阅链接、主动订阅选择、节点列表、节点切换和延时测试。
+- 保存代理设置后会自动重新加载 AI 页面，立即应用新的代理入口。
+- 新用户设置面板内置订阅与节点引导，支持按步骤完成首次配置。
 - 启动页显示内置代理启动进度和失败诊断。
 - 下载中心记录历史下载，支持打开文件、打开目录、删除记录和清空已完成。
 - 下载保存目录可配置，默认是 `data/Downloads`。
@@ -88,7 +90,7 @@ target_portable\portable\EasyGPT
 输出文件：
 
 ```text
-target_installer\installer\EasyGPT-windows-x64-Setup-0.1.3.exe
+target_installer\installer\EasyGPT-windows-x64-Setup-0.1.4.exe
 ```
 
 安装目录默认是：
@@ -171,7 +173,6 @@ export EASYGPT_DATA_DIR="$HOME/.local/share/EasyGPT/data"
 
 - `direct`：直连。
 - `system`：读取系统代理。
-- `manual`：使用手动代理。
 - `internal_clash`：启动内置 mihomo，并且只让本应用走代理。
 
 内置代理运行文件位于：
@@ -184,11 +185,13 @@ data/clash/
 
 - 添加多个订阅链接。
 - 选择当前订阅。
+- 根据提示逐步完成首次订阅和节点配置。
 - 刷新订阅和 mihomo 配置。
 - 查看策略组和节点。
 - 切换节点。
 - 测试节点延时。
 - 保存已选策略组和节点。
+- 保存后自动重载当前 AI 页面，立即应用新代理设置。
 - 查看最近 mihomo 日志。
 
 ## 下载中心
@@ -240,11 +243,27 @@ data/Downloads
 
 推送到 `main` 或发起 PR 时会构建验证。推送 `v*` 标签时会发布 Release。
 
+当前成品下载页：
+
+- [EasyGPT v0.1.4 Release](https://github.com/T786279007/easygpt/releases/tag/v0.1.4)
+
+常用下载直链：
+
+- [Windows 安装包（EasyGPT-windows-x64-Setup-0.1.4.exe）](https://github.com/T786279007/easygpt/releases/download/v0.1.4/EasyGPT-windows-x64-Setup-0.1.4.exe)
+- [Windows 便携版（EasyGPT-windows-x64-portable.zip）](https://github.com/T786279007/easygpt/releases/download/v0.1.4/EasyGPT-windows-x64-portable.zip)
+- [macOS Apple Silicon DMG（EasyGPT-macos-arm64.dmg）](https://github.com/T786279007/easygpt/releases/download/v0.1.4/EasyGPT-macos-arm64.dmg)
+- [macOS Apple Silicon App 压缩包（EasyGPT-macos-arm64-app.tar.gz）](https://github.com/T786279007/easygpt/releases/download/v0.1.4/EasyGPT-macos-arm64-app.tar.gz)
+- [macOS Intel DMG（EasyGPT-macos-x64.dmg）](https://github.com/T786279007/easygpt/releases/download/v0.1.4/EasyGPT-macos-x64.dmg)
+- [macOS Intel App 压缩包（EasyGPT-macos-x64-app.tar.gz）](https://github.com/T786279007/easygpt/releases/download/v0.1.4/EasyGPT-macos-x64-app.tar.gz)
+- [Linux Debian 安装包（EasyGPT-linux-x64.deb）](https://github.com/T786279007/easygpt/releases/download/v0.1.4/EasyGPT-linux-x64.deb)
+- [Linux 便携压缩包（EasyGPT-linux-x64-portable.tar.gz）](https://github.com/T786279007/easygpt/releases/download/v0.1.4/EasyGPT-linux-x64-portable.tar.gz)
+- [SHA256 校验文件（SHA256SUMS.txt）](https://github.com/T786279007/easygpt/releases/download/v0.1.4/SHA256SUMS.txt)
+
 发布命令示例：
 
 ```bash
-git tag v0.1.3
-git push origin v0.1.3
+git tag v0.1.4
+git push origin v0.1.4
 ```
 
 Release 产物包括：
