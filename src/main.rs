@@ -1548,11 +1548,54 @@ fn runtime_ready_script_for_site(site: AiSite) -> String {
     .replace("__SITE_URL__", site.url())
 }
 
+/// Returns a targeted, actionable hint based on the real cause of the failure,
+/// instead of always blaming a missing mihomo binary. Substring matching is
+/// intentionally coarse (the error text comes from anyhow `{error:#}` chains),
+/// ordered from most specific to least specific.
+fn proxy_failure_hint(error_message: &str) -> &'static str {
+    let lower = error_message.to_ascii_lowercase();
+
+    // Subscription downloaded but not valid Clash YAML — check before the generic
+    // "subscription" branch below, since invalid-YAML errors also contain "subscription".
+    if lower.contains("not valid yaml") || lower.contains("not clash yaml") {
+        return "订阅返回的内容不是有效的 Clash 配置。请检查订阅链接是否正确、是否需要 Clash 格式的订阅地址。";
+    }
+
+    // No subscription configured yet — the most common first-run failure.
+    if error_message.contains("requires a subscription URL")
+        || lower.contains("subscription")
+    {
+        return "当前还没有可用的订阅。请在设置 → 代理中填入订阅链接，或在代理模式里先选「直连 / 系统代理」跳过内置代理。";
+    }
+
+    // mihomo started but the controller never came up — usually a config/subscription issue.
+    // Must be checked before the generic "mihomo" branch below, since the message also
+    // contains the word "mihomo".
+    if lower.contains("did not become ready") || lower.contains("controller") {
+        return "mihomo 已启动但控制器未就绪，通常是订阅或配置问题。可在设置 → 代理中查看最近日志，或更换节点/订阅后重试。";
+    }
+
+    // mihomo binary genuinely missing — keep the original install/repair hint.
+    if lower.contains("could not find bundled mihomo")
+        || lower.contains("resources/clash/mihomo")
+        || lower.contains("mihomo")
+    {
+        return "请确认程序包里存在 resources/clash/mihomo，或重新解压完整安装包/便携包后启动。";
+    }
+
+    // Port conflict.
+    if lower.contains("port") && (lower.contains("bind") || lower.contains("in use")) {
+        return "可能是端口被占用。请关闭其他占用本地端口的程序（如其他 Clash 客户端）后重试。";
+    }
+
+    "内置代理启动失败。可在设置 → 代理中查看订阅、节点和最近日志，或临时改用「直连 / 系统代理」。"
+}
+
 fn runtime_failed_script(error_message: &str) -> String {
     let payload = json!({
         "title": "内置代理启动失败",
         "message": error_message,
-        "hint": "请确认程序包里存在 resources/clash/mihomo，或重新解压完整安装包/便携包后启动。",
+        "hint": proxy_failure_hint(error_message),
     });
     format!(
         r#"
@@ -7453,6 +7496,45 @@ mod tests {
         assert!(script.contains("resources/clash/mihomo"));
         assert!(script.contains("document.body.innerHTML = '';"));
         assert!(script.contains("window.__chatgptClientEnsureSettingsUi"));
+    }
+
+    #[test]
+    fn proxy_failure_hint_matches_error_cause() {
+        // No subscription configured — must NOT blame a missing mihomo binary.
+        let hint = super::proxy_failure_hint(
+            "internal Clash mode requires a subscription URL, or an existing cached subscription with auto-update disabled",
+        );
+        assert!(hint.contains("订阅"));
+        assert!(!hint.contains("resources/clash/mihomo"));
+
+        // Genuinely missing mihomo binary.
+        assert!(
+            super::proxy_failure_hint("could not find bundled mihomo. Checked: ...")
+                .contains("resources/clash/mihomo")
+        );
+
+        // Invalid subscription YAML.
+        assert!(super::proxy_failure_hint("subscription is not valid YAML").contains("Clash 配置"));
+
+        // Controller never ready.
+        assert!(super::proxy_failure_hint("mihomo did not become ready at 127.0.0.1:9090")
+            .contains("控制器"));
+
+        // Port conflict.
+        assert!(super::proxy_failure_hint("port 7890 is in use").contains("端口"));
+
+        // Unknown error falls back to a generic hint.
+        assert!(super::proxy_failure_hint("something else went wrong").contains("内置代理启动失败"));
+    }
+
+    #[test]
+    fn runtime_failed_script_uses_targeted_hint_for_missing_subscription() {
+        let script = super::runtime_failed_script(
+            "internal Clash mode requires a subscription URL, or an existing cached subscription with auto-update disabled",
+        );
+
+        assert!(script.contains("订阅"));
+        assert!(!script.contains("resources/clash/mihomo"));
     }
 
     #[test]
